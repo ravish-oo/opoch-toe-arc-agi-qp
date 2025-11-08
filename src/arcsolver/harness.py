@@ -23,6 +23,7 @@ from typing import Set, Dict, Any
 import numpy as np
 from . import receipts
 from . import bins as bins_module
+from . import embed as embed_module
 from .utils import hash_utils
 from .config import GRID_DTYPE
 
@@ -432,6 +433,166 @@ def run_stage_wo1(data_root: Path, strict: bool = False, enable_progress: bool =
         sys.exit(1)
 
 
+def run_stage_wo2(data_root: Path, strict: bool = False, enable_progress: bool = True) -> None:
+    """Run WO-2 stage: embedding and period tests.
+
+    Args:
+        data_root: Directory containing ARC JSON files
+        strict: If True, fail on first error; else continue and report
+        enable_progress: If True, write progress JSON
+
+    Notes:
+        - Embeds training outputs using mode from WO-1 center predicate
+        - Tests idempotence (reembed round-trip)
+        - Detects torus periods using byte-exact equality
+        - Tests metamorphic invariance (FREE roll preserves predicate)
+        - Emits receipts/<task_id>/wo02.json
+    """
+    # Discover task IDs
+    print(f"[WO-2] Discovering tasks in {data_root}...", file=sys.stderr)
+    task_ids = discover_task_ids(data_root)
+    print(f"[WO-2] Found {len(task_ids)} tasks", file=sys.stderr)
+
+    # Initialize progress tracking
+    progress = init_progress(wo=2)
+
+    # Process each task
+    success_count = 0
+    fail_count = 0
+    for task_id in sorted(task_ids):  # Sort for deterministic order
+        progress["tasks_total"] += 1
+        try:
+            # Load task data
+            task_data = load_task_data(data_root, task_id)
+            train_pairs = task_data["train"]
+
+            if len(train_pairs) == 0:
+                raise ValueError(f"Task {task_id} has no training pairs")
+
+            # Extract training outputs as numpy arrays
+            train_outputs = []
+            for pair in train_pairs:
+                output_grid = np.array(pair["output"], dtype=GRID_DTYPE)
+                train_outputs.append(output_grid)
+
+            # Determine canvas (from WO-1 or use most common shape)
+            shapes = [g.shape for g in train_outputs]
+            unique_shapes = set(shapes)
+
+            if len(unique_shapes) == 1:
+                H_out, W_out = shapes[0]
+                has_constant_canvas = True
+            else:
+                from collections import Counter
+                shape_counts = Counter(shapes)
+                H_out, W_out = shape_counts.most_common(1)[0][0]
+                has_constant_canvas = False
+
+            # Determine embedding mode using WO-1 center predicate
+            if has_constant_canvas:
+                is_centered = bins_module.center_predicate_all(train_outputs, H_out, W_out)
+                mode = "center" if is_centered else "topleft"
+            else:
+                mode = "topleft"  # Default for variable shapes
+
+            # Embed all training outputs that match canvas
+            embedded_outputs = []
+            for output in train_outputs:
+                if output.shape == (H_out, W_out):
+                    embedded = embed_module.embed_to_canvas(output, H_out, W_out, mode)
+                    embedded_outputs.append(embedded)
+
+            if len(embedded_outputs) == 0:
+                raise ValueError(f"No outputs match canvas ({H_out}, {W_out})")
+
+            # Test idempotence on first embedded output
+            first_output = train_outputs[0] if train_outputs[0].shape == (H_out, W_out) else embedded_outputs[0]
+            reembed_ok = embed_module.reembed_round_trip_ok(first_output, H_out, W_out, mode)
+            acc_bool(progress, "embed_idempotent_ok", reembed_ok)
+
+            # Compute periods on first embedded output
+            first_embedded = embedded_outputs[0]
+            p_y, p_x = embed_module.periods_2d_exact(first_embedded)
+
+            # Verify period by rolling and checking equality
+            rolled_y = np.roll(first_embedded, shift=p_y, axis=0)
+            eq_check_y = bool(np.array_equal(first_embedded, rolled_y))
+
+            rolled_x = np.roll(first_embedded, shift=p_x, axis=1)
+            eq_check_x = bool(np.array_equal(first_embedded, rolled_x))
+
+            # Hash first embedded output
+            embedded_hash = hash_utils.hash_ndarray_int(first_embedded)
+
+            # Metamorphic check: FREE roll preserves centering predicate
+            # Apply a verified FREE roll (if period allows) and check predicate invariance
+            metamorphic_ok = True
+            if has_constant_canvas and len(embedded_outputs) > 0:
+                # Test: if we roll outputs by detected period, does predicate stay same?
+                # This is a simple metamorphic check - full FREE verification comes later
+                try:
+                    # Roll all outputs by period in y direction
+                    rolled_outputs = [np.roll(out, shift=p_y, axis=0) for out in embedded_outputs]
+                    # Recompute centering predicate on rolled outputs
+                    is_centered_rolled = bins_module.center_predicate_all(rolled_outputs, H_out, W_out)
+                    # Metamorphic: predicate boolean should be identical
+                    metamorphic_ok = (is_centered_rolled == is_centered)
+                except Exception:
+                    metamorphic_ok = False
+
+            acc_bool(progress, "embed_metamorphic_ok", metamorphic_ok)
+
+            # Build WO-2 receipt
+            payload = {
+                "stage": "wo02",
+                "embedding": {
+                    "mode": mode,
+                    "H_out": int(H_out),
+                    "W_out": int(W_out),
+                    "reembed_round_trip_ok": reembed_ok,
+                    "embedded_hash": embedded_hash,
+                },
+                "periods": {
+                    "p_y": int(p_y),
+                    "p_x": int(p_x),
+                    "eq_check_y": eq_check_y,
+                    "eq_check_x": eq_check_x,
+                },
+            }
+
+            # Write receipt
+            receipts.write_stage_receipt(task_id, "wo02", payload)
+            success_count += 1
+            progress["tasks_ok"] += 1
+            if success_count % 100 == 0:
+                print(
+                    f"[WO-2] Progress: {success_count}/{len(task_ids)} receipts written",
+                    file=sys.stderr,
+                )
+
+        except Exception as e:
+            fail_count += 1
+            msg = f"[WO-2] Failed to process task {task_id}: {e}"
+            if strict:
+                raise RuntimeError(msg) from e
+            else:
+                print(msg, file=sys.stderr)
+
+    # Summary
+    print(
+        f"[WO-2] Complete: {success_count} receipts written, {fail_count} failures",
+        file=sys.stderr,
+    )
+
+    # Write progress
+    if enable_progress:
+        receipts.write_run_progress(progress)
+        print(f"[WO-2] Progress written to progress/progress_wo02.json", file=sys.stderr)
+
+    if fail_count > 0 and strict:
+        sys.exit(1)
+
+
 def main() -> None:
     """CLI entry point for harness."""
     parser = argparse.ArgumentParser(
@@ -497,10 +658,14 @@ Examples:
     if args.upto_wo >= 1:
         run_stage_wo1(args.data_root, strict=args.strict, enable_progress=args.progress)
 
-    # WO-2+: Not implemented yet
+    # WO-2: Embedding and period tests
     if args.upto_wo >= 2:
+        run_stage_wo2(args.data_root, strict=args.strict, enable_progress=args.progress)
+
+    # WO-3+: Not implemented yet
+    if args.upto_wo >= 3:
         print(
-            f"[harness] WO-{args.upto_wo} not implemented yet (only WO-0/1 available)",
+            f"[harness] WO-{args.upto_wo} not implemented yet (only WO-0/1/2 available)",
             file=sys.stderr,
         )
         sys.exit(1)

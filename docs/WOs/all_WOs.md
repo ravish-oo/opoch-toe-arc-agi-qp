@@ -6,7 +6,7 @@
 2. **WO-1: Bins & predicates** ✅ COMPLETED
    periphery–parity bins, center predicate, bbox on `!=0`. Tests: fixed hashes.
 
-3. **WO-2: Embedding & Period tests**
+3. **WO-2: Embedding & Period tests** ✅ COMPLETED
    topleft/center embed; byte-exact period detection. Tests: round-trip.
 
 4. **WO-3: Color signatures + Hungarian adapter**
