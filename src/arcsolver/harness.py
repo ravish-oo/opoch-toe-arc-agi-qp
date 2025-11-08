@@ -839,8 +839,10 @@ def run_stage_wo4(data_root: Path, strict: bool = False, enable_progress: bool =
             train_inputs_emb = []
             for i, input_grid in enumerate(train_inputs):
                 if train_outputs[i].shape == (H_out, W_out):
-                    # Embed input to same canvas
-                    embedded_input = embed_module.embed_to_canvas(input_grid, H_out, W_out, mode)
+                    # Inverse-sample input at output coordinates (handles size mismatch)
+                    embedded_input, _ = mask_module.sample_test_input_at_output_coords(
+                        input_grid, H_out, W_out, mode
+                    )
                     train_inputs_emb.append(embedded_input)
 
             # Get bins for canonical bin histograms (needed for alignment)
