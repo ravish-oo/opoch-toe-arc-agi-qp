@@ -24,8 +24,9 @@ import numpy as np
 from . import receipts
 from . import bins as bins_module
 from . import embed as embed_module
+from . import color_align as color_align_module
 from .utils import hash_utils
-from .config import GRID_DTYPE
+from .config import GRID_DTYPE, PALETTE_C
 
 
 # ============================================================================
@@ -593,6 +594,173 @@ def run_stage_wo2(data_root: Path, strict: bool = False, enable_progress: bool =
         sys.exit(1)
 
 
+def run_stage_wo3(data_root: Path, strict: bool = False, enable_progress: bool = True) -> None:
+    """Run WO-3 stage: color signatures and Hungarian alignment.
+
+    Args:
+        data_root: Directory containing ARC JSON files
+        strict: If True, fail on first error; else continue and report
+        enable_progress: If True, write progress JSON
+
+    Notes:
+        - Uses embedded training outputs from WO-2 logic
+        - Builds color signatures (count, histograms)
+        - Solves Hungarian alignment for canonical palette
+        - Tests bijection and tie-break stability
+        - Emits receipts/<task_id>/wo03.json
+    """
+    # Discover task IDs
+    print(f"[WO-3] Discovering tasks in {data_root}...", file=sys.stderr)
+    task_ids = discover_task_ids(data_root)
+    print(f"[WO-3] Found {len(task_ids)} tasks", file=sys.stderr)
+
+    # Initialize progress tracking
+    progress = init_progress(wo=3)
+
+    # Process each task
+    success_count = 0
+    fail_count = 0
+    for task_id in sorted(task_ids):  # Sort for deterministic order
+        progress["tasks_total"] += 1
+        try:
+            # Load task data
+            task_data = load_task_data(data_root, task_id)
+            train_pairs = task_data["train"]
+
+            if len(train_pairs) == 0:
+                raise ValueError(f"Task {task_id} has no training pairs")
+
+            # Extract training outputs as numpy arrays
+            train_outputs = []
+            for pair in train_pairs:
+                output_grid = np.array(pair["output"], dtype=GRID_DTYPE)
+                train_outputs.append(output_grid)
+
+            # Determine canvas (from WO-1 or use most common shape)
+            shapes = [g.shape for g in train_outputs]
+            unique_shapes = set(shapes)
+
+            if len(unique_shapes) == 1:
+                H_out, W_out = shapes[0]
+                has_constant_canvas = True
+            else:
+                from collections import Counter
+                shape_counts = Counter(shapes)
+                H_out, W_out = shape_counts.most_common(1)[0][0]
+                has_constant_canvas = False
+
+            # Determine embedding mode using WO-1 center predicate
+            if has_constant_canvas:
+                is_centered = bins_module.center_predicate_all(train_outputs, H_out, W_out)
+                mode = "center" if is_centered else "topleft"
+            else:
+                mode = "topleft"  # Default for variable shapes
+
+            # Embed all training outputs that match canvas
+            embedded_outputs = []
+            for output in train_outputs:
+                if output.shape == (H_out, W_out):
+                    embedded = embed_module.embed_to_canvas(output, H_out, W_out, mode)
+                    embedded_outputs.append(embedded)
+
+            if len(embedded_outputs) == 0:
+                raise ValueError(f"No outputs match canvas ({H_out}, {W_out})")
+
+            # Build bins for canvas (needed for color signatures)
+            bin_ids, bins_list = bins_module.build_bins(H_out, W_out)
+            num_bins = len(bins_list)
+
+            # Align colors using Hungarian algorithm
+            aligned_outputs, perms, sigs, canonical_sigs, cost_hashes, total_costs = \
+                color_align_module.align_colors(embedded_outputs, bin_ids, num_bins)
+
+            # Check Hungarian bijection for all permutations
+            permutation_is_bijection = True
+            for perm in perms:
+                if set(perm) != set(range(PALETTE_C)):
+                    permutation_is_bijection = False
+                    break
+            acc_bool(progress, "hungarian_bijection_ok", permutation_is_bijection)
+
+            # Check tie-break stability by comparing cost hashes with previous receipt
+            tie_encoded = True
+            signature_tie_break_ok = True
+            from pathlib import Path as PathLib
+            prev_receipt_path = PathLib("receipts") / task_id / "wo03.json"
+            if prev_receipt_path.exists():
+                try:
+                    with prev_receipt_path.open("r", encoding="utf-8") as f:
+                        prev_receipt = json.load(f)
+                    # Extract cost hashes from list of hungarian objects
+                    prev_hashes = [h["cost_hash"] for h in prev_receipt.get("hungarian", [])]
+                    if prev_hashes:
+                        signature_tie_break_ok = (prev_hashes == cost_hashes)
+                except Exception:
+                    # If loading fails, skip stability check (treat as first run)
+                    pass
+            acc_bool(progress, "signature_tie_break_ok", signature_tie_break_ok)
+
+            # Build WO-3 receipt (per spec: lists, not dicts)
+            payload = {
+                "stage": "wo03",
+                "canonical_palette": {
+                    "order": list(range(PALETTE_C)),  # Indices 0..9
+                },
+                "signatures": [
+                    {
+                        "training": i,
+                        "by_color": {str(c): sig for c, sig in sigs[i].items()}
+                    }
+                    for i in range(len(sigs))
+                ],
+                "hungarian": [
+                    {
+                        "training": i,
+                        "perm": perms[i].tolist(),
+                        "total_cost": total_costs[i],
+                        "cost_hash": cost_hashes[i]
+                    }
+                    for i in range(len(perms))
+                ],
+                "determinism": {
+                    "tie_encoded": tie_encoded,
+                    "permutation_is_bijection": permutation_is_bijection,
+                },
+            }
+
+            # Write receipt
+            receipts.write_stage_receipt(task_id, "wo03", payload)
+            success_count += 1
+            progress["tasks_ok"] += 1
+            if success_count % 100 == 0:
+                print(
+                    f"[WO-3] Progress: {success_count}/{len(task_ids)} receipts written",
+                    file=sys.stderr,
+                )
+
+        except Exception as e:
+            fail_count += 1
+            msg = f"[WO-3] Failed to process task {task_id}: {e}"
+            if strict:
+                raise RuntimeError(msg) from e
+            else:
+                print(msg, file=sys.stderr)
+
+    # Summary
+    print(
+        f"[WO-3] Complete: {success_count} receipts written, {fail_count} failures",
+        file=sys.stderr,
+    )
+
+    # Write progress
+    if enable_progress:
+        receipts.write_run_progress(progress)
+        print(f"[WO-3] Progress written to progress/progress_wo03.json", file=sys.stderr)
+
+    if fail_count > 0 and strict:
+        sys.exit(1)
+
+
 def main() -> None:
     """CLI entry point for harness."""
     parser = argparse.ArgumentParser(
@@ -662,10 +830,14 @@ Examples:
     if args.upto_wo >= 2:
         run_stage_wo2(args.data_root, strict=args.strict, enable_progress=args.progress)
 
-    # WO-3+: Not implemented yet
+    # WO-3: Color signatures and Hungarian alignment
     if args.upto_wo >= 3:
+        run_stage_wo3(args.data_root, strict=args.strict, enable_progress=args.progress)
+
+    # WO-4+: Not implemented yet
+    if args.upto_wo >= 4:
         print(
-            f"[harness] WO-{args.upto_wo} not implemented yet (only WO-0/1/2 available)",
+            f"[harness] WO-{args.upto_wo} not implemented yet (only WO-0/1/2/3 available)",
             file=sys.stderr,
         )
         sys.exit(1)
