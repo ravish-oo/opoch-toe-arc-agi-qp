@@ -25,6 +25,7 @@ from . import receipts
 from . import bins as bins_module
 from . import embed as embed_module
 from . import color_align as color_align_module
+from . import mask as mask_module
 from .utils import hash_utils
 from .config import GRID_DTYPE, PALETTE_C
 
@@ -761,6 +762,272 @@ def run_stage_wo3(data_root: Path, strict: bool = False, enable_progress: bool =
         sys.exit(1)
 
 
+def run_stage_wo4(data_root: Path, strict: bool = False, enable_progress: bool = True) -> None:
+    """Run WO-4 stage: forward meet closure and color-agnostic lift.
+
+    Args:
+        data_root: Directory containing ARC JSON files
+        strict: If True, fail on first error; else continue and report
+        enable_progress: If True, write progress JSON
+
+    Notes:
+        - Builds forward meet closure F[p,k,c] (order-free, idempotent)
+        - Applies color-agnostic lift
+        - Tests idempotence and order-independence
+        - Emits receipts/<task_id>/wo04.json
+    """
+    # Discover task IDs
+    print(f"[WO-4] Discovering tasks in {data_root}...", file=sys.stderr)
+    task_ids = discover_task_ids(data_root)
+    print(f"[WO-4] Found {len(task_ids)} tasks", file=sys.stderr)
+
+    # Initialize progress tracking
+    progress = init_progress(wo=4)
+
+    # Process each task
+    success_count = 0
+    fail_count = 0
+    for task_id in sorted(task_ids):  # Sort for deterministic order
+        progress["tasks_total"] += 1
+        try:
+            # Load task data
+            task_data = load_task_data(data_root, task_id)
+            train_pairs = task_data["train"]
+            test_pair = task_data["test"][0]  # First test
+
+            if len(train_pairs) == 0:
+                raise ValueError(f"Task {task_id} has no training pairs")
+
+            # Extract training pairs as numpy arrays
+            train_inputs = []
+            train_outputs = []
+            for pair in train_pairs:
+                input_grid = np.array(pair["input"], dtype=GRID_DTYPE)
+                output_grid = np.array(pair["output"], dtype=GRID_DTYPE)
+                train_inputs.append(input_grid)
+                train_outputs.append(output_grid)
+
+            # Extract test input
+            test_input = np.array(test_pair["input"], dtype=GRID_DTYPE)
+
+            # Determine canvas (from WO-1 or use most common shape)
+            shapes = [g.shape for g in train_outputs]
+            unique_shapes = set(shapes)
+
+            if len(unique_shapes) == 1:
+                H_out, W_out = shapes[0]
+            else:
+                from collections import Counter
+                shape_counts = Counter(shapes)
+                H_out, W_out = shape_counts.most_common(1)[0][0]
+
+            # Determine embedding mode (from WO-2)
+            if len(unique_shapes) == 1:
+                is_centered = bins_module.center_predicate_all(train_outputs, H_out, W_out)
+                mode = "center" if is_centered else "topleft"
+            else:
+                mode = "topleft"
+
+            # Embed training outputs and test input
+            train_outputs_emb = []
+            for output in train_outputs:
+                if output.shape == (H_out, W_out):
+                    embedded = embed_module.embed_to_canvas(output, H_out, W_out, mode)
+                    train_outputs_emb.append(embedded)
+
+            # Embed corresponding inputs (match dimensions)
+            train_inputs_emb = []
+            for i, input_grid in enumerate(train_inputs):
+                if train_outputs[i].shape == (H_out, W_out):
+                    # Embed input to same canvas
+                    embedded_input = embed_module.embed_to_canvas(input_grid, H_out, W_out, mode)
+                    train_inputs_emb.append(embedded_input)
+
+            # Get bins for canonical bin histograms (needed for alignment)
+            bin_ids, bins_list = bins_module.build_bins(H_out, W_out)
+            num_bins = len(bins_list)
+
+            # Align colors (from WO-3)
+            aligned_outputs, perms, sigs, canonical_sigs, cost_hashes, total_costs = \
+                color_align_module.align_colors(train_outputs_emb, bin_ids, num_bins)
+
+            # Apply same permutations to inputs (align input colors consistently)
+            aligned_inputs = []
+            for input_emb, perm in zip(train_inputs_emb, perms):
+                # Create inverse permutation for relabeling
+                inv_perm = np.zeros(PALETTE_C, dtype=GRID_DTYPE)
+                for orig_c in range(PALETTE_C):
+                    inv_perm[perm[orig_c]] = orig_c
+
+                # Relabel input
+                aligned_input = np.full_like(input_emb, -1)
+                for new_c in range(PALETTE_C):
+                    orig_c = inv_perm[new_c]
+                    aligned_input[input_emb == orig_c] = new_c
+
+                # Preserve padding
+                aligned_input[input_emb == -1] = -1
+
+                aligned_inputs.append(aligned_input)
+
+            # Build training pairs (embedded & aligned)
+            train_pairs_emb_aligned = list(zip(aligned_inputs, aligned_outputs))
+
+            # Build forward meet closure F (ORIGINAL ORDER, WITHOUT LIFT)
+            F_original = mask_module.build_forward_meet(
+                train_pairs_emb_aligned, H_out, W_out
+            )
+
+            # Compute admits stats BEFORE lift
+            seen_mask = mask_module.build_seen_mask(train_pairs_emb_aligned, H_out, W_out)
+            stats_before_lift = mask_module.admits_stats(F_original, seen=seen_mask)
+            avg_admits_before = stats_before_lift["avg_admits_per_pixel"]
+
+            # Apply color-agnostic lift (modifies F in-place, returns stats)
+            F_with_lift, lift_stats = mask_module.apply_color_agnostic_lift(
+                F_original.copy(), train_pairs_emb_aligned, H_out, W_out
+            )
+
+            # Compute admits stats AFTER lift
+            stats_after_lift = mask_module.admits_stats(F_with_lift, seen=seen_mask)
+            avg_admits_after = stats_after_lift["avg_admits_per_pixel"]
+
+            # Hash F_with_lift for idempotence and order-independence tests
+            F_hash_original = hash_utils.hash_ndarray_int(
+                F_with_lift.view(np.uint8).reshape(-1)
+            )
+
+            # Test idempotence: rebuild F (same order, with lift)
+            F_idempotent = mask_module.build_forward_meet(
+                train_pairs_emb_aligned, H_out, W_out
+            )
+            F_idempotent, _ = mask_module.apply_color_agnostic_lift(
+                F_idempotent, train_pairs_emb_aligned, H_out, W_out
+            )
+            F_hash_idempotent = hash_utils.hash_ndarray_int(
+                F_idempotent.view(np.uint8).reshape(-1)
+            )
+            idempotent_ok = (F_hash_original == F_hash_idempotent)
+
+            # Test order-independence: rebuild with reverse and cyclic shift
+            # Reverse order
+            train_pairs_reversed = list(reversed(train_pairs_emb_aligned))
+            F_reversed = mask_module.build_forward_meet(
+                train_pairs_reversed, H_out, W_out
+            )
+            F_reversed, _ = mask_module.apply_color_agnostic_lift(
+                F_reversed, train_pairs_emb_aligned, H_out, W_out
+            )
+            F_hash_reversed = hash_utils.hash_ndarray_int(
+                F_reversed.view(np.uint8).reshape(-1)
+            )
+
+            # Cyclic shift (+1)
+            train_pairs_cyclic = train_pairs_emb_aligned[1:] + train_pairs_emb_aligned[:1]
+            F_cyclic = mask_module.build_forward_meet(
+                train_pairs_cyclic, H_out, W_out
+            )
+            F_cyclic, _ = mask_module.apply_color_agnostic_lift(
+                F_cyclic, train_pairs_emb_aligned, H_out, W_out
+            )
+            F_hash_cyclic = hash_utils.hash_ndarray_int(
+                F_cyclic.view(np.uint8).reshape(-1)
+            )
+
+            # Check all hashes match (order-independent)
+            closure_order_independent_ok = (
+                F_hash_original == F_hash_reversed == F_hash_cyclic
+            )
+            acc_bool(progress, "closure_order_independent_ok", closure_order_independent_ok)
+
+            # Inverse-sample test input at output coordinates (handles size mismatch)
+            test_input_sampled, test_sampling_stats = mask_module.sample_test_input_at_output_coords(
+                test_input, H_out, W_out, mode
+            )
+
+            # Align test input using first training's permutation (canonical)
+            if len(perms) > 0:
+                perm_test = perms[0]
+                inv_perm_test = np.zeros(PALETTE_C, dtype=GRID_DTYPE)
+                for orig_c in range(PALETTE_C):
+                    inv_perm_test[perm_test[orig_c]] = orig_c
+
+                # Relabel: map each pixel's original color to aligned color
+                test_input_aligned = test_input_sampled.copy()
+                for new_c in range(PALETTE_C):
+                    orig_c = inv_perm_test[new_c]
+                    test_input_aligned[test_input_sampled == orig_c] = new_c
+                # Preserve unseen sentinel
+                test_input_aligned[test_input_sampled == -1] = -1
+            else:
+                test_input_aligned = test_input_sampled
+
+            # Flatten for build_test_mask (now expects flattened input)
+            test_input_aligned_flat = test_input_aligned.ravel(order='C')
+
+            # Build test mask A using F_with_lift
+            A = mask_module.build_test_mask(F_with_lift, test_input_aligned_flat)
+
+            # Build WO-4 receipt
+            N = H_out * W_out
+            payload = {
+                "stage": "wo04",
+                "mask": {
+                    "F_shape": [N, PALETTE_C, PALETTE_C],
+                    "F_hash": F_hash_original,
+                    "idempotent_ok": idempotent_ok,
+                    "closure_order_independent_ok": closure_order_independent_ok,
+                    "avg_admits_before_lift": avg_admits_before,
+                    "avg_admits_after_lift": avg_admits_after,
+                    "total_true": stats_after_lift["total_true"],
+                },
+                "lift": lift_stats,
+                "test_sampling": test_sampling_stats,
+                "A_mask": {
+                    "A_shape": [N, PALETTE_C],
+                    "A_hash": hash_utils.hash_ndarray_int(
+                        A.view(np.uint8).reshape(-1)
+                    ),
+                },
+            }
+
+            # Track avg_admits in progress (before and after lift)
+            acc_sum(progress, "avg_admits_before", int(avg_admits_before * 1000))
+            acc_sum(progress, "avg_admits_after", int(avg_admits_after * 1000))
+
+            # Write receipt
+            receipts.write_stage_receipt(task_id, "wo04", payload)
+            success_count += 1
+            progress["tasks_ok"] += 1
+            if success_count % 100 == 0:
+                print(
+                    f"[WO-4] Progress: {success_count}/{len(task_ids)} receipts written",
+                    file=sys.stderr,
+                )
+
+        except Exception as e:
+            fail_count += 1
+            msg = f"[WO-4] Failed to process task {task_id}: {e}"
+            if strict:
+                raise RuntimeError(msg) from e
+            else:
+                print(msg, file=sys.stderr)
+
+    # Summary
+    print(
+        f"[WO-4] Complete: {success_count} receipts written, {fail_count} failures",
+        file=sys.stderr,
+    )
+
+    # Write progress
+    if enable_progress:
+        receipts.write_run_progress(progress)
+        print(f"[WO-4] Progress written to progress/progress_wo04.json", file=sys.stderr)
+
+    if fail_count > 0 and strict:
+        sys.exit(1)
+
+
 def main() -> None:
     """CLI entry point for harness."""
     parser = argparse.ArgumentParser(
@@ -834,10 +1101,14 @@ Examples:
     if args.upto_wo >= 3:
         run_stage_wo3(args.data_root, strict=args.strict, enable_progress=args.progress)
 
-    # WO-4+: Not implemented yet
+    # WO-4: Forward meet closure and color-agnostic lift
     if args.upto_wo >= 4:
+        run_stage_wo4(args.data_root, strict=args.strict, enable_progress=args.progress)
+
+    # WO-5+: Not implemented yet
+    if args.upto_wo >= 5:
         print(
-            f"[harness] WO-{args.upto_wo} not implemented yet (only WO-0/1/2/3 available)",
+            f"[harness] WO-{args.upto_wo} not implemented yet (only WO-0/1/2/3/4 available)",
             file=sys.stderr,
         )
         sys.exit(1)
