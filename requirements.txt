@@ -1,0 +1,7 @@
+# WO-0 pinned dependencies (contracts 05)
+# Python 3.11.x required
+
+numpy>=2.1.0,<2.2.0
+scipy>=1.13.0,<1.14.0
+ortools>=9.10.0,<9.11.0
+scikit-image>=0.23.0,<0.24.0
