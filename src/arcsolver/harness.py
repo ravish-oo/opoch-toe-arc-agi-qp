@@ -1,14 +1,13 @@
-"""WO-0 harness.py - CLI runner for multi-stage ARC solver.
+"""WO-0/1 harness.py - CLI runner for multi-stage ARC solver.
 
 Provides a command-line interface to run the solver on ARC tasks.
 
-At WO-0, we only:
-- Validate environment & versions
-- Emit per-task receipts proving compliance with anchors/contracts
-- No actual solving (stages WO-1+)
+WO-0: Environment validation and receipts
+WO-1: Bins, bbox, center predicate
 
 Usage:
     python -m arcsolver.harness --data-root data/ --upto-wo 0
+    python -m arcsolver.harness --data-root data/ --upto-wo 1
 
 Flags:
     --data-root: Directory containing ARC JSON files
@@ -20,8 +19,12 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Set
+from typing import Set, Dict, Any
+import numpy as np
 from . import receipts
+from . import bins as bins_module
+from .utils import hash_utils
+from .config import GRID_DTYPE
 
 
 def discover_task_ids(data_root: Path) -> Set[str]:
@@ -68,6 +71,38 @@ def discover_task_ids(data_root: Path) -> Set[str]:
     return task_ids
 
 
+def load_task_data(data_root: Path, task_id: str) -> Dict[str, Any]:
+    """Load task data for a given task ID.
+
+    Args:
+        data_root: Directory containing ARC JSON files
+        task_id: Task identifier
+
+    Returns:
+        Task data dict with 'train' and 'test' keys
+
+    Raises:
+        FileNotFoundError: If task not found in any file
+    """
+    arc_files = [
+        "arc-agi_training_challenges.json",
+        "arc-agi_evaluation_challenges.json",
+        "arc-agi_test_challenges.json",
+    ]
+
+    for fname in arc_files:
+        fpath = data_root / fname
+        if not fpath.exists():
+            continue
+
+        with fpath.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+            if task_id in data:
+                return data[task_id]
+
+    raise FileNotFoundError(f"Task {task_id} not found in any ARC file")
+
+
 def run_stage_wo0(data_root: Path, strict: bool = False) -> None:
     """Run WO-0 stage: environment validation and receipt emission.
 
@@ -112,6 +147,167 @@ def run_stage_wo0(data_root: Path, strict: bool = False) -> None:
     # Summary
     print(
         f"[WO-0] Complete: {success_count} receipts written, {fail_count} failures",
+        file=sys.stderr,
+    )
+    if fail_count > 0 and strict:
+        sys.exit(1)
+
+
+def run_stage_wo1(data_root: Path, strict: bool = False) -> None:
+    """Run WO-1 stage: bins, bbox, center predicate.
+
+    Args:
+        data_root: Directory containing ARC JSON files
+        strict: If True, fail on first error; else continue and report
+
+    Notes:
+        - Loads actual task data (train/test)
+        - For each task, computes bins, bbox, center predicate
+        - Emits receipts/<task_id>/wo01.json
+        - Assumes all training outputs have same shape (canvas)
+        - At WO-1, we don't do embedding yet, so we use raw output grids
+    """
+    # Discover task IDs
+    print(f"[WO-1] Discovering tasks in {data_root}...", file=sys.stderr)
+    task_ids = discover_task_ids(data_root)
+    print(f"[WO-1] Found {len(task_ids)} tasks", file=sys.stderr)
+
+    # Process each task
+    success_count = 0
+    fail_count = 0
+    for task_id in sorted(task_ids):  # Sort for deterministic order
+        try:
+            # Load task data
+            task_data = load_task_data(data_root, task_id)
+            train_pairs = task_data["train"]
+
+            if len(train_pairs) == 0:
+                raise ValueError(f"Task {task_id} has no training pairs")
+
+            # Extract training outputs as numpy arrays
+            train_outputs = []
+            for pair in train_pairs:
+                output_grid = np.array(pair["output"], dtype=GRID_DTYPE)
+                train_outputs.append(output_grid)
+
+            # Infer canvas: check if all outputs have same shape
+            # (size inference is not implemented yet in WO-1)
+            shapes = [g.shape for g in train_outputs]
+            unique_shapes = set(shapes)
+
+            if len(unique_shapes) == 1:
+                # All outputs same shape - this is the canvas
+                H_out, W_out = shapes[0]
+                has_constant_canvas = True
+            else:
+                # Variable output shapes - use most common shape as canvas for WO-1
+                # (proper size inference will come in later WOs)
+                from collections import Counter
+                shape_counts = Counter(shapes)
+                H_out, W_out = shape_counts.most_common(1)[0][0]
+                has_constant_canvas = False
+
+            # Build bins for canvas
+            bin_ids, bins_list = bins_module.build_bins(H_out, W_out)
+
+            # Compute bin counts
+            bin_counts = [len(b) for b in bins_list]
+
+            # Hash bin_ids
+            bin_ids_hash = hash_utils.hash_ndarray_int(bin_ids)
+
+            # Hash each bin's pixel indices
+            bin_index_hashes = [hash_utils.hash_ndarray_int(b) for b in bins_list]
+
+            # Compute bbox on first training output that matches canvas
+            bbox = None
+            has_content = False
+            bbox_slices = None
+            for output in train_outputs:
+                if output.shape == (H_out, W_out):
+                    bbox = bins_module.bbox_content(output)
+                    has_content = bbox is not None
+                    bbox_slices = list(bbox) if bbox else None
+                    break
+
+            # Check center predicate only if all outputs match canvas
+            if has_constant_canvas:
+                is_centered = bins_module.center_predicate_all(train_outputs, H_out, W_out)
+                mode = "center" if is_centered else "topleft"
+
+                # Compute per-training distances to canvas center
+                center_r = (H_out - 1) / 2.0
+                center_c = (W_out - 1) / 2.0
+                per_train_distances = []
+                for grid in train_outputs:
+                    content_mask = (grid != 0) & (grid != -1)
+                    if np.any(content_mask):
+                        from scipy.ndimage import center_of_mass
+                        com = center_of_mass(content_mask)
+                        com_r, com_c = com
+                        delta_r = abs(com_r - center_r)
+                        delta_c = abs(com_c - center_c)
+                        per_train_distances.append([delta_r, delta_c])
+                    else:
+                        per_train_distances.append([float('inf'), float('inf')])
+            else:
+                # Variable shapes - can't check center predicate yet
+                mode = "topleft-pending-size"
+                per_train_distances = []
+
+            # Build WO-1 receipt
+            payload = {
+                "stage": "wo01",
+                "canvas": {"H_out": int(H_out), "W_out": int(W_out)},
+                "bins": {
+                    "num_bins": len(bins_list),
+                    "bin_counts": bin_counts,
+                    "bin_ids_hash": bin_ids_hash,
+                    "bin_index_hashes": bin_index_hashes,
+                },
+                "bbox": {
+                    "has_content": has_content,
+                    "bbox_slices": bbox_slices,
+                },
+                "center_predicate": {
+                    "mode": mode,
+                    "per_train_distances": per_train_distances,
+                },
+            }
+
+            # Invariant checks
+            assert sum(bin_counts) == H_out * W_out, \
+                f"Bin counts sum {sum(bin_counts)} != H*W {H_out*W_out}"
+            if bbox is not None:
+                r0, r1, c0, c1 = bbox
+                assert 0 <= r0 < r1 <= H_out, f"Invalid bbox rows: {bbox}"
+                assert 0 <= c0 < c1 <= W_out, f"Invalid bbox cols: {bbox}"
+            if has_constant_canvas and mode == "center":
+                for dr, dc in per_train_distances:
+                    if dr != float('inf'):  # Skip empty content
+                        assert dr <= 0.5 and dc <= 0.5, \
+                            f"Center mode but delta ({dr}, {dc}) > 0.5"
+
+            # Write receipt
+            receipts.write_stage_receipt(task_id, "wo01", payload)
+            success_count += 1
+            if success_count % 100 == 0:
+                print(
+                    f"[WO-1] Progress: {success_count}/{len(task_ids)} receipts written",
+                    file=sys.stderr,
+                )
+
+        except Exception as e:
+            fail_count += 1
+            msg = f"[WO-1] Failed to process task {task_id}: {e}"
+            if strict:
+                raise RuntimeError(msg) from e
+            else:
+                print(msg, file=sys.stderr)
+
+    # Summary
+    print(
+        f"[WO-1] Complete: {success_count} receipts written, {fail_count} failures",
         file=sys.stderr,
     )
     if fail_count > 0 and strict:
@@ -167,10 +363,14 @@ Examples:
     if args.upto_wo >= 0:
         run_stage_wo0(args.data_root, strict=args.strict)
 
-    # WO-1+: Not implemented yet
+    # WO-1: Bins, bbox, center predicate
     if args.upto_wo >= 1:
+        run_stage_wo1(args.data_root, strict=args.strict)
+
+    # WO-2+: Not implemented yet
+    if args.upto_wo >= 2:
         print(
-            f"[harness] WO-{args.upto_wo} not implemented yet (only WO-0 available)",
+            f"[harness] WO-{args.upto_wo} not implemented yet (only WO-0/1 available)",
             file=sys.stderr,
         )
         sys.exit(1)
