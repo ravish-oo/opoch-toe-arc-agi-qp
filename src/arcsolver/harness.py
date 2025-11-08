@@ -27,6 +27,76 @@ from .utils import hash_utils
 from .config import GRID_DTYPE
 
 
+# ============================================================================
+# WO-specific metric keys (extend-only registry)
+# ============================================================================
+WO_METRICS = {
+    1: ["bins_sum_ok", "bins_hash_stable", "center_all_ok"],
+    2: ["embed_idempotent_ok", "embed_metamorphic_ok"],
+    3: ["hungarian_bijection_ok", "signature_tie_break_ok"],
+    4: ["closure_order_independent_ok", "avg_admits_before", "avg_admits_after"],
+    5: ["bin_constancy_proved"],
+    6: ["free_cost_invariance_ok"],
+    7: ["flow_feasible_ok", "kkt_ok", "one_of_10_ok"],
+    8: ["idempotence_ok", "bits_sum"],
+    9: ["laminar_confluence_ok", "iis_count"],
+}
+
+
+def init_progress(wo: int) -> Dict[str, Any]:
+    """Initialize progress tracking dict for a work order.
+
+    Args:
+        wo: Work order number
+
+    Returns:
+        Progress dict with wo, tasks_total, tasks_ok, pre-initialized metrics
+    """
+    keys = WO_METRICS.get(wo, [])
+    return {
+        "wo": wo,
+        "tasks_total": 0,
+        "tasks_ok": 0,
+        "metrics": {k: {"ok": 0, "total": 0, "sum": 0} for k in keys}
+    }
+
+
+def acc_bool(progress: Dict[str, Any], key: str, ok: bool) -> None:
+    """Accumulate boolean metric in progress dict.
+
+    Args:
+        progress: Progress dict
+        key: Metric key
+        ok: Boolean value (True if check passed)
+
+    Notes:
+        - Silently ignores unknown keys (forward compatibility)
+        - Increments total, increments ok if True
+    """
+    if key not in progress["metrics"]:
+        return
+    m = progress["metrics"][key]
+    m["total"] += 1
+    m["ok"] += int(bool(ok))
+
+
+def acc_sum(progress: Dict[str, Any], key: str, val: int) -> None:
+    """Accumulate integer sum in progress dict.
+
+    Args:
+        progress: Progress dict
+        key: Metric key
+        val: Integer value to add to sum
+
+    Notes:
+        - Silently ignores unknown keys (forward compatibility)
+        - Adds val to sum field
+    """
+    if key not in progress["metrics"]:
+        return
+    progress["metrics"][key]["sum"] += int(val)
+
+
 def discover_task_ids(data_root: Path) -> Set[str]:
     """Discover all task IDs from ARC JSON files.
 
@@ -103,12 +173,13 @@ def load_task_data(data_root: Path, task_id: str) -> Dict[str, Any]:
     raise FileNotFoundError(f"Task {task_id} not found in any ARC file")
 
 
-def run_stage_wo0(data_root: Path, strict: bool = False) -> None:
+def run_stage_wo0(data_root: Path, strict: bool = False, enable_progress: bool = True) -> None:
     """Run WO-0 stage: environment validation and receipt emission.
 
     Args:
         data_root: Directory containing ARC JSON files
         strict: If True, fail on first error; else continue and report
+        enable_progress: If True, write progress JSON
 
     Notes:
         - Discovers all task IDs
@@ -121,6 +192,9 @@ def run_stage_wo0(data_root: Path, strict: bool = False) -> None:
     task_ids = discover_task_ids(data_root)
     print(f"[WO-0] Found {len(task_ids)} tasks", file=sys.stderr)
 
+    # Initialize progress tracking
+    progress = init_progress(wo=0)
+
     # Generate environment payload (same for all tasks at WO-0)
     env_payload = receipts.make_env_payload()
 
@@ -128,9 +202,11 @@ def run_stage_wo0(data_root: Path, strict: bool = False) -> None:
     success_count = 0
     fail_count = 0
     for task_id in sorted(task_ids):  # Sort for deterministic order
+        progress["tasks_total"] += 1
         try:
             receipt_path = receipts.write_stage_receipt(task_id, "wo00", env_payload)
             success_count += 1
+            progress["tasks_ok"] += 1
             if success_count % 100 == 0:
                 print(
                     f"[WO-0] Progress: {success_count}/{len(task_ids)} receipts written",
@@ -149,16 +225,23 @@ def run_stage_wo0(data_root: Path, strict: bool = False) -> None:
         f"[WO-0] Complete: {success_count} receipts written, {fail_count} failures",
         file=sys.stderr,
     )
+
+    # Write progress
+    if enable_progress:
+        receipts.write_run_progress(progress)
+        print(f"[WO-0] Progress written to progress/progress_wo00.json", file=sys.stderr)
+
     if fail_count > 0 and strict:
         sys.exit(1)
 
 
-def run_stage_wo1(data_root: Path, strict: bool = False) -> None:
+def run_stage_wo1(data_root: Path, strict: bool = False, enable_progress: bool = True) -> None:
     """Run WO-1 stage: bins, bbox, center predicate.
 
     Args:
         data_root: Directory containing ARC JSON files
         strict: If True, fail on first error; else continue and report
+        enable_progress: If True, write progress JSON
 
     Notes:
         - Loads actual task data (train/test)
@@ -172,10 +255,14 @@ def run_stage_wo1(data_root: Path, strict: bool = False) -> None:
     task_ids = discover_task_ids(data_root)
     print(f"[WO-1] Found {len(task_ids)} tasks", file=sys.stderr)
 
+    # Initialize progress tracking
+    progress = init_progress(wo=1)
+
     # Process each task
     success_count = 0
     fail_count = 0
     for task_id in sorted(task_ids):  # Sort for deterministic order
+        progress["tasks_total"] += 1
         try:
             # Load task data
             task_data = load_task_data(data_root, task_id)
@@ -218,6 +305,22 @@ def run_stage_wo1(data_root: Path, strict: bool = False) -> None:
 
             # Hash each bin's pixel indices
             bin_index_hashes = [hash_utils.hash_ndarray_int(b) for b in bins_list]
+
+            # Check hash stability across runs (critical determinism check)
+            # Load previous receipt if it exists and compare bin_ids_hash
+            from pathlib import Path as PathLib
+            prev_receipt_path = PathLib("receipts") / task_id / "wo01.json"
+            if prev_receipt_path.exists():
+                try:
+                    with prev_receipt_path.open("r", encoding="utf-8") as f:
+                        prev_receipt = json.load(f)
+                    prev_hash = prev_receipt.get("bins", {}).get("bin_ids_hash", None)
+                    if prev_hash is not None:
+                        hash_stable = (prev_hash == bin_ids_hash)
+                        acc_bool(progress, "bins_hash_stable", hash_stable)
+                except Exception:
+                    # If loading fails, skip stability check (treat as first run)
+                    pass
 
             # Compute bbox on first training output that matches canvas
             bbox = None
@@ -275,22 +378,31 @@ def run_stage_wo1(data_root: Path, strict: bool = False) -> None:
                 },
             }
 
-            # Invariant checks
-            assert sum(bin_counts) == H_out * W_out, \
+            # Invariant checks and progress tracking
+            bins_sum_ok = sum(bin_counts) == H_out * W_out
+            assert bins_sum_ok, \
                 f"Bin counts sum {sum(bin_counts)} != H*W {H_out*W_out}"
+            acc_bool(progress, "bins_sum_ok", bins_sum_ok)
+
             if bbox is not None:
                 r0, r1, c0, c1 = bbox
                 assert 0 <= r0 < r1 <= H_out, f"Invalid bbox rows: {bbox}"
                 assert 0 <= c0 < c1 <= W_out, f"Invalid bbox cols: {bbox}"
+
+            # Check center predicate invariant
+            center_all_ok = True
             if has_constant_canvas and mode == "center":
                 for dr, dc in per_train_distances:
                     if dr != float('inf'):  # Skip empty content
-                        assert dr <= 0.5 and dc <= 0.5, \
-                            f"Center mode but delta ({dr}, {dc}) > 0.5"
+                        if not (dr <= 0.5 and dc <= 0.5):
+                            center_all_ok = False
+                            assert False, f"Center mode but delta ({dr}, {dc}) > 0.5"
+                acc_bool(progress, "center_all_ok", center_all_ok)
 
             # Write receipt
             receipts.write_stage_receipt(task_id, "wo01", payload)
             success_count += 1
+            progress["tasks_ok"] += 1
             if success_count % 100 == 0:
                 print(
                     f"[WO-1] Progress: {success_count}/{len(task_ids)} receipts written",
@@ -310,6 +422,12 @@ def run_stage_wo1(data_root: Path, strict: bool = False) -> None:
         f"[WO-1] Complete: {success_count} receipts written, {fail_count} failures",
         file=sys.stderr,
     )
+
+    # Write progress
+    if enable_progress:
+        receipts.write_run_progress(progress)
+        print(f"[WO-1] Progress written to progress/progress_wo01.json", file=sys.stderr)
+
     if fail_count > 0 and strict:
         sys.exit(1)
 
@@ -345,6 +463,18 @@ Examples:
         action="store_true",
         help="Fail on first error (default: continue and report)",
     )
+    parser.add_argument(
+        "--progress",
+        action="store_true",
+        default=True,
+        help="Write progress JSON (default: enabled)",
+    )
+    parser.add_argument(
+        "--no-progress",
+        dest="progress",
+        action="store_false",
+        help="Disable progress JSON writing",
+    )
 
     args = parser.parse_args()
 
@@ -361,11 +491,11 @@ Examples:
 
     # WO-0: Environment validation & receipts
     if args.upto_wo >= 0:
-        run_stage_wo0(args.data_root, strict=args.strict)
+        run_stage_wo0(args.data_root, strict=args.strict, enable_progress=args.progress)
 
     # WO-1: Bins, bbox, center predicate
     if args.upto_wo >= 1:
-        run_stage_wo1(args.data_root, strict=args.strict)
+        run_stage_wo1(args.data_root, strict=args.strict, enable_progress=args.progress)
 
     # WO-2+: Not implemented yet
     if args.upto_wo >= 2:

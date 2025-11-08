@@ -1,7 +1,7 @@
 now let's expand this wo. so now tell me what kinds of "mature, well-documented Python libraries for every primitive we need" can be reused for
 
-1. **WO-0: Core types & guards**
-   dtypes, lex orders, env vars, helpers. Unit tests: dtype & env asserts.
+**WO-2: Embedding & Period tests**
+   topleft/center embed; byte-exact period detection. Tests: round-trip.
 
 now here are the things u must take care of:
 1. now thr is nothing called underspecificy in development. instead  we shud be ovespecific. but anything that u r specifying must be STRICTLY grounded in our anchor docs we created.

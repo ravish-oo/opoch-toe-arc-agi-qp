@@ -163,11 +163,11 @@ def check_min_cost_flow_kkt(solution, graph_struct) -> bool:
 
 ## Reviewer Write-Up Template (paste after each WO)
 
-**Subject:** ARC Solver — WO-{N} Progress Report (Π/GLUE/FY/TU receipts)
+**Subject:** ARC Solver — WO-01 Progress Report (Π/GLUE/FY/TU receipts)
 
 Hi,
 
-Here is the progress for **WO-{N}: {Title}**.
+Here is the progress for **WO-01: {Title}**.
 Our goal at each WO is not “accuracy versus labels” (that comes at the end), but **conformance to the calculus** we’ve specified: Π canonicals, GLUE interfaces, FY-tight paid steps, TU integrality. The harness emits two artifacts:
 
 1. **Per-task receipts** under `receipts/<task_id>/wo{N}.json` (byte-stable), and

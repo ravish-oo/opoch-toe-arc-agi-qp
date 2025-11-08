@@ -1,9 +1,9 @@
 # Bottom-up WO plan (atomic, ≤300–400 LOC per WO)
 
-1. **WO-0: Core types & guards**
+1. **WO-0: Core types & guards** ✅ COMPLETED
    dtypes, lex orders, env vars, helpers. Unit tests: dtype & env asserts.
 
-2. **WO-1: Bins & predicates**
+2. **WO-1: Bins & predicates** ✅ COMPLETED
    periphery–parity bins, center predicate, bbox on `!=0`. Tests: fixed hashes.
 
 3. **WO-2: Embedding & Period tests**

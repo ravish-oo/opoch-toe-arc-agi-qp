@@ -206,6 +206,7 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 
-# ARC data and generated receipts
+# ARC data and generated receipts/progress
 data/
 receipts/
+progress/

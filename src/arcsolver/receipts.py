@@ -111,3 +111,40 @@ def make_env_payload() -> Dict[str, Any]:
             "PYTHONHASHSEED": os.getenv("PYTHONHASHSEED"),
         },
     }
+
+
+def write_run_progress(progress: Dict[str, Any], out_dir: str = "progress") -> Path:
+    """Write run-level progress JSON for a work order.
+
+    Args:
+        progress: Progress dict with wo, tasks_total, tasks_ok, metrics
+        out_dir: Output directory (default: 'progress')
+
+    Returns:
+        Path to written progress file
+
+    Notes:
+        - Creates progress directory if needed
+        - Writes with sorted keys, Unix newlines
+        - Filename: progress_woXX.json where XX is zero-padded WO number
+        - Overwrites existing progress for same WO
+    """
+    # Create progress directory
+    progress_dir = Path(out_dir)
+    progress_dir.mkdir(parents=True, exist_ok=True)
+
+    # Write progress
+    wo_num = progress["wo"]
+    progress_path = progress_dir / f"progress_wo{wo_num:02d}.json"
+    with progress_path.open("w", encoding="utf-8", newline="\n") as f:
+        json.dump(
+            progress,
+            f,
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            indent=2,
+        )
+        f.write("\n")  # Trailing newline for Unix convention
+
+    return progress_path
