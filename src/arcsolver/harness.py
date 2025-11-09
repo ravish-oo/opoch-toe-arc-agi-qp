@@ -41,7 +41,7 @@ WO_METRICS = {
     3: ["hungarian_bijection_ok", "signature_tie_break_ok"],
     4: ["closure_order_independent_ok", "avg_admits_before", "avg_admits_after"],
     5: ["commuting_rows_ok", "gravity_rows_unique_ok", "harmonic_rows_built_ok"],
-    6: ["free_cost_invariance_ok"],
+    6: ["free_cost_invariance_ok", "free_constraint_invariance_ok"],
     7: ["flow_feasible_ok", "kkt_ok", "one_of_10_ok"],
     8: ["idempotence_ok", "bits_sum"],
     9: ["laminar_confluence_ok", "iis_count"],
@@ -1291,6 +1291,283 @@ def run_stage_wo5(data_root: Path, strict: bool = False, enable_progress: bool =
         sys.exit(1)
 
 
+def run_stage_wo6(data_root: Path, strict: bool = False, enable_progress: bool = True) -> None:
+    """WO-6: Π-safe Scores and FREE Predicate
+
+    Builds:
+    - Π-safe scores ŝ ∈ ℝ^(N×C) using bins/mask only
+    - Integer costs via round(-ŝ * SCALE)
+    - FREE predicate checks for verified symmetries
+
+    All operations are byte-exact, deterministic, Π-safe.
+    """
+    print("[WO-6] Building Π-safe scores & checking FREE predicate...", file=sys.stderr)
+
+    # Import required modules
+    import hashlib
+    from arcsolver import scores as scores_module
+    from arcsolver import bins as bins_module
+
+    # Initialize progress
+    progress = init_progress(6)
+
+    # Discover tasks
+    task_ids = discover_task_ids(data_root)
+    print(f"[WO-6] Found {len(task_ids)} tasks", file=sys.stderr)
+
+    # Create receipts directory
+    receipts_dir = Path("receipts")
+    receipts_dir.mkdir(exist_ok=True)
+
+    success_count = 0
+    fail_count = 0
+
+    for task_id in sorted(task_ids):
+        try:
+            # Load WO-1 receipt (bins)
+            wo1_receipt_path = receipts_dir / task_id / "wo01.json"
+            if not wo1_receipt_path.exists():
+                raise FileNotFoundError(f"WO-1 receipt not found: {wo1_receipt_path}")
+
+            with open(wo1_receipt_path) as f:
+                wo1_receipt = json.load(f)
+
+            # Load WO-2 receipt (embedding, periods)
+            wo2_receipt_path = receipts_dir / task_id / "wo02.json"
+            if not wo2_receipt_path.exists():
+                raise FileNotFoundError(f"WO-2 receipt not found: {wo2_receipt_path}")
+
+            with open(wo2_receipt_path) as f:
+                wo2_receipt = json.load(f)
+
+            H_out = wo2_receipt["embedding"]["H_out"]
+            W_out = wo2_receipt["embedding"]["W_out"]
+
+            # Load WO-3 receipt (color permutations)
+            wo3_receipt_path = receipts_dir / task_id / "wo03.json"
+            if not wo3_receipt_path.exists():
+                raise FileNotFoundError(f"WO-3 receipt not found: {wo3_receipt_path}")
+
+            with open(wo3_receipt_path) as f:
+                wo3_receipt = json.load(f)
+
+            # Load WO-4 receipt and artifacts (A-mask)
+            wo4_receipt_path = receipts_dir / task_id / "wo04.json"
+            if not wo4_receipt_path.exists():
+                raise FileNotFoundError(f"WO-4 receipt not found: {wo4_receipt_path}")
+
+            with open(wo4_receipt_path) as f:
+                wo4_receipt = json.load(f)
+
+            artifacts_path = receipts_dir / task_id / "wo04_artifacts.npz"
+            if not artifacts_path.exists():
+                raise FileNotFoundError(f"WO-4 artifacts not found: {artifacts_path}")
+
+            artifacts = np.load(artifacts_path)
+            A_mask = artifacts["A_mask"]
+
+            # Extract aligned_outputs for equalizer rebuilding (Issue #3 fix)
+            aligned_outputs = artifacts["aligned_outputs"]
+            train_outputs_aligned = [aligned_outputs[i] for i in range(aligned_outputs.shape[0])]
+
+            # Load WO-5 receipt (harmonic features)
+            wo5_receipt_path = receipts_dir / task_id / "wo05.json"
+            if not wo5_receipt_path.exists():
+                raise FileNotFoundError(f"WO-5 receipt not found: {wo5_receipt_path}")
+
+            with open(wo5_receipt_path) as f:
+                wo5_receipt = json.load(f)
+
+            # Build bins (deterministic, same as WO-5)
+            bin_ids, bins_list = bins_module.build_bins(H_out, W_out)
+
+            N = H_out * W_out
+            C = 10  # ARC color palette size
+
+            # === BUILD Π-SAFE SCORES ===
+            stage_features = {
+                "harmonic": wo5_receipt.get("harmonic", {}),
+                "equalizers": wo5_receipt.get("equalizers", {}),
+                "gravity": wo5_receipt.get("gravity", {}),
+            }
+
+            scores = scores_module.build_scores_pi_safe(
+                H=H_out,
+                W=W_out,
+                A_mask=A_mask,
+                bin_ids=bin_ids,
+                stage_features=stage_features,
+            )
+
+            # Runtime self-test: Verify Π-safe equivariance
+            scores_module.assert_pi_safety_equivariance(
+                scores=scores,
+                A_mask=A_mask,
+                bin_ids=bin_ids,
+                H=H_out,
+                W=W_out,
+                stage_features=stage_features
+            )
+
+            # Convert to integer costs
+            costs = scores_module.to_int_costs(scores)
+
+            # Compute hash of scores (for receipt)
+            scores_hash = hashlib.sha256(scores.tobytes()).hexdigest()
+            costs_hash = hashlib.sha256(costs.tobytes()).hexdigest()
+
+            # === RECONSTRUCT FREE MAP CANDIDATES ===
+            free_map_candidates = []
+
+            # 1. From WO-2: periods (torus rolls) - only if verified
+            if "periods" in wo2_receipt:
+                p_y = wo2_receipt["periods"]["p_y"]
+                p_x = wo2_receipt["periods"]["p_x"]
+
+                # Check verification flags (eq_check_x, eq_check_y)
+                eq_check_y = wo2_receipt.get("eq_check_y", False)
+                eq_check_x = wo2_receipt.get("eq_check_x", False)
+
+                # Add non-trivial periods as FREE map candidates ONLY if verified
+                if p_y < H_out and eq_check_y:
+                    free_map_candidates.append({
+                        "type": "roll",
+                        "dy": int(p_y),
+                        "dx": 0,
+                        "source": "wo2_period_y_verified"
+                    })
+
+                if p_x < W_out and eq_check_x:
+                    free_map_candidates.append({
+                        "type": "roll",
+                        "dy": 0,
+                        "dx": int(p_x),
+                        "source": "wo2_period_x_verified"
+                    })
+
+            # 2. From WO-3: color symmetries (channel permutations)
+            if "hungarian" in wo3_receipt:
+                for hungarian_entry in wo3_receipt["hungarian"]:
+                    if "perm" in hungarian_entry:
+                        perm = hungarian_entry["perm"]
+                        free_map_candidates.append({
+                            "type": "perm",
+                            "perm": perm,
+                            "source": "wo3_hungarian"
+                        })
+
+            # === CHECK FREE PREDICATE ===
+            free_checks = []
+
+            # Rebuild equalizer rows deterministically (Issue #3 fix)
+            # Per patch §B: "Persist from WO-5 or deterministically rebuild"
+            import arcsolver.eqs as eqs_module
+            equalizer_edges = eqs_module.build_equalizer_rows(
+                bin_ids=bin_ids,
+                num_bins=wo1_receipt["bins"]["num_bins"],
+                A_mask=A_mask,
+                train_outputs_aligned=train_outputs_aligned,
+                H_out=H_out,
+                W_out=W_out
+            )
+
+            # Convert equalizer dict to flat edge list for FREE gate
+            # Format: [(p_i, p_j, c), ...] where p_i < p_j
+            equalizer_rows = []
+            for (bin_id, color), edges in equalizer_edges.items():
+                for (p1, p2) in edges:
+                    equalizer_rows.append((p1, p2, color))
+
+            # Faces not yet implemented
+            faces = None
+
+            for U in free_map_candidates:
+                cost_ok, constraint_ok = scores_module.check_free_predicate(
+                    scores=scores,
+                    A_mask=A_mask,
+                    U=U,
+                    H=H_out,
+                    W=W_out,
+                    equalizer_rows=equalizer_rows,
+                    faces=faces,
+                )
+
+                free_checks.append({
+                    "symmetry": {k: v for k, v in U.items() if k != "source"},
+                    "source": U.get("source", "unknown"),
+                    "cost_invariance": bool(cost_ok),
+                    "constraint_invariance": bool(constraint_ok),
+                    "is_free": bool(cost_ok and constraint_ok),
+                })
+
+            # Count FREE maps
+            free_count = sum(1 for check in free_checks if check["is_free"])
+
+            # Accumulate progress metrics: track cost and constraint invariance separately
+            all_cost_ok = all(check["cost_invariance"] for check in free_checks) if free_checks else True
+            all_constraint_ok = all(check["constraint_invariance"] for check in free_checks) if free_checks else True
+            acc_bool(progress, "free_cost_invariance_ok", all_cost_ok)
+            acc_bool(progress, "free_constraint_invariance_ok", all_constraint_ok)
+
+            # Build receipt
+            payload = {
+                "stage": "wo06",
+                "scores": {
+                    "shape": [int(N), int(C)],
+                    "dtype": "float64",
+                    "hash_sha256": scores_hash,
+                    "pi_safe": True,
+                },
+                "costs": {
+                    "shape": [int(N), int(C)],
+                    "dtype": "int64",
+                    "hash_sha256": costs_hash,
+                    "scale": 1_000_000,
+                },
+                "free_predicate": {
+                    "candidates_checked": len(free_checks),
+                    "free_maps_verified": free_count,
+                    "checks": free_checks,
+                },
+            }
+
+            # Write receipt
+            task_receipt_dir = receipts_dir / task_id
+            task_receipt_dir.mkdir(exist_ok=True)
+
+            wo6_receipt_path = task_receipt_dir / "wo06.json"
+            with open(wo6_receipt_path, "w") as f:
+                json.dump(payload, f, indent=2)
+
+            success_count += 1
+
+            # Progress reporting
+            if enable_progress and success_count % 100 == 0:
+                print(f"[WO-6] Progress: {success_count}/{len(task_ids)} receipts written", file=sys.stderr)
+
+        except Exception as e:
+            print(f"[WO-6] Failed to process task {task_id}: {e}", file=sys.stderr)
+            if fail_count < 2:  # Print traceback for first 2 errors only
+                traceback.print_exc(file=sys.stderr)
+            fail_count += 1
+            if strict:
+                raise
+
+    # Summary
+    print(
+        f"[WO-6] Complete: {success_count} receipts written, {fail_count} failures",
+        file=sys.stderr,
+    )
+
+    # Write progress
+    if enable_progress:
+        receipts.write_run_progress(progress)
+        print(f"[WO-6] Progress written to progress/progress_wo06.json", file=sys.stderr)
+
+    if fail_count > 0 and strict:
+        sys.exit(1)
+
+
 def main() -> None:
     """CLI entry point for harness."""
     parser = argparse.ArgumentParser(
@@ -1350,6 +1627,7 @@ Examples:
         3: run_stage_wo3,
         4: run_stage_wo4,
         5: run_stage_wo5,
+        6: run_stage_wo6,
     }
 
     # Run stages
