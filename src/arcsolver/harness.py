@@ -1484,7 +1484,8 @@ def run_stage_wo6(data_root: Path, strict: bool = False, enable_progress: bool =
                 stage_features=stage_features,
             )
 
-            # Runtime self-test: Verify Π-safe equivariance
+            # Runtime self-test: Verify Π-safe equivariance (BEFORE projection)
+            # The test must run on unprojected scores since it rebuilds from scratch
             scores_module.assert_pi_safety_equivariance(
                 scores=scores,
                 A_mask=A_mask,
@@ -1494,10 +1495,37 @@ def run_stage_wo6(data_root: Path, strict: bool = False, enable_progress: bool =
                 stage_features=stage_features
             )
 
+            # Hash scores before projection (for receipt)
+            scores_hash_before = hashlib.sha256(scores.tobytes()).hexdigest()
+
+            # === APPLY PERIOD PROJECTION IF VERIFIED ===
+            # Per 02_addendum.md §B: "include the projector first" for FREE invariance
+            # Per 02_addendum.md §J: Haar projector P_rep = (1/p) Σ T^k
+            periods = wo2_receipt.get("periods", {})
+            p_y = periods.get("p_y", H_out)
+            p_x = periods.get("p_x", W_out)
+            eq_check_y = periods.get("eq_check_y", False)
+            eq_check_x = periods.get("eq_check_x", False)
+
+            # Determine if we have non-trivial verified periods
+            has_verified_period_y = (p_y < H_out and eq_check_y)
+            has_verified_period_x = (p_x < W_out and eq_check_x)
+            projected_under_period = has_verified_period_y or has_verified_period_x
+
+            if projected_under_period:
+                # Apply Haar projector to enforce period invariance on scores
+                scores = scores_module.project_scores_under_periods(
+                    scores=scores,
+                    H=H_out,
+                    W=W_out,
+                    p_y=p_y,
+                    p_x=p_x
+                )
+
             # Convert to integer costs
             costs = scores_module.to_int_costs(scores)
 
-            # Compute hash of scores (for receipt)
+            # Compute hash of scores after projection (for receipt)
             scores_hash = hashlib.sha256(scores.tobytes()).hexdigest()
             costs_hash = hashlib.sha256(costs.tobytes()).hexdigest()
 
@@ -1505,30 +1533,50 @@ def run_stage_wo6(data_root: Path, strict: bool = False, enable_progress: bool =
             free_map_candidates = []
 
             # 1. From WO-2: periods (torus rolls) - only if verified
-            periods = wo2_receipt.get("periods", {})
-            p_y = periods.get("p_y", H_out)
-            p_x = periods.get("p_x", W_out)
-            eq_check_y = periods.get("eq_check_y", False)
-            eq_check_x = periods.get("eq_check_x", False)
+            # Note: periods dict already loaded above for projection
 
-            # Add non-trivial periods as FREE map candidates ONLY if verified
-            if p_y < H_out and eq_check_y:
+            # Generate ALL non-identity multiples of verified periods as candidates
+            # Per 02_addendum.md §B and §J: test all subgroup elements separately
+            cand_dys = []
+            if eq_check_y and 0 < p_y < H_out:
+                # Generate non-identity multiples: p_y, 2*p_y, ..., (H/p_y - 1)*p_y
+                cand_dys = [ (n * p_y) % H_out for n in range(1, H_out // p_y) ]
+
+            cand_dxs = []
+            if eq_check_x and 0 < p_x < W_out:
+                # Generate non-identity multiples: p_x, 2*p_x, ..., (W/p_x - 1)*p_x
+                cand_dxs = [ (m * p_x) % W_out for m in range(1, W_out // p_x) ]
+
+            # Add y-only candidates
+            for dy in cand_dys:
                 free_map_candidates.append({
                     "type": "roll",
-                    "dy": int(p_y),
+                    "dy": int(dy),
                     "dx": 0,
                     "verified_all_trainings": True,
                     "source": "wo2_period_y_verified"
                 })
 
-            if p_x < W_out and eq_check_x:
+            # Add x-only candidates
+            for dx in cand_dxs:
                 free_map_candidates.append({
                     "type": "roll",
                     "dy": 0,
-                    "dx": int(p_x),
+                    "dx": int(dx),
                     "verified_all_trainings": True,
                     "source": "wo2_period_x_verified"
                 })
+
+            # Add combined (dy, dx) candidates
+            for dy in cand_dys:
+                for dx in cand_dxs:
+                    free_map_candidates.append({
+                        "type": "roll",
+                        "dy": int(dy),
+                        "dx": int(dx),
+                        "verified_all_trainings": True,
+                        "source": "wo2_period_xy_verified"
+                    })
 
             # 2. From WO-3: verified color symmetries (NOT Hungarian alignments)
             # Hungarian permutations are alignment transforms, not symmetries
@@ -1590,14 +1638,27 @@ def run_stage_wo6(data_root: Path, strict: bool = False, enable_progress: bool =
             acc_bool(progress, "free_constraint_invariance_ok", all_constraint_ok)
 
             # Build receipt
+            scores_receipt = {
+                "shape": [int(N), int(C)],
+                "dtype": "float64",
+                "hash_sha256_before": scores_hash_before,
+                "hash_sha256": scores_hash,
+                "pi_safe": True,
+                "projected_under_period": projected_under_period,
+            }
+
+            # Add period metadata if projection was applied
+            if projected_under_period:
+                scores_receipt["periods"] = {
+                    "p_y": int(p_y),
+                    "p_x": int(p_x),
+                    "verified_y": eq_check_y,
+                    "verified_x": eq_check_x,
+                }
+
             payload = {
                 "stage": "wo06",
-                "scores": {
-                    "shape": [int(N), int(C)],
-                    "dtype": "float64",
-                    "hash_sha256": scores_hash,
-                    "pi_safe": True,
-                },
+                "scores": scores_receipt,
                 "costs": {
                     "shape": [int(N), int(C)],
                     "dtype": "int64",
