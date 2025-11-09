@@ -597,6 +597,87 @@ def run_stage_wo2(data_root: Path, strict: bool = False, enable_progress: bool =
         sys.exit(1)
 
 
+def detect_verified_color_symmetries(aligned_outputs: list[np.ndarray]) -> list[dict]:
+    """
+    Detect and verify color symmetries across all aligned training outputs.
+
+    Per anchor 02_addendum.md §C: A color subgroup H⊂S₁₀ is verified iff
+    every aligned training output is byte-identical under every π∈H.
+
+    Args:
+        aligned_outputs: List of aligned training outputs (H,W) int32 arrays
+
+    Returns:
+        List of verified symmetry dicts: [{"type": "perm", "perm": [...], "verified_all_trainings": True}, ...]
+    """
+    if not aligned_outputs:
+        return []
+
+    # Build per-color boolean layers for each training
+    # L[i][c] = (Y_i == c) for each training i and color c
+    layers = []
+    for Y in aligned_outputs:
+        training_layers = {}
+        for c in range(PALETTE_C):
+            training_layers[c] = (Y == c)
+        layers.append(training_layers)
+
+    # Find orbits: partition colors by byte-identical layers across ALL trainings
+    # Two colors c, d are in same orbit iff layers[i][c] == layers[i][d] for all i
+    from collections import defaultdict
+    # Use hash of concatenated layers as orbit key
+    orbit_map = defaultdict(list)
+
+    for c in range(PALETTE_C):
+        # Create a hashable key from all training layers for this color
+        layer_key = tuple(
+            layers[i][c].tobytes() for i in range(len(aligned_outputs))
+        )
+        orbit_map[layer_key].append(c)
+
+    orbits = list(orbit_map.values())
+
+    # For each orbit of size > 1, test all non-identity permutations within orbit
+    verified_symmetries = []
+
+    for orbit in orbits:
+        if len(orbit) <= 1:
+            continue  # Trivial orbit, skip
+
+        # Generate all permutations within this orbit
+        import itertools
+        for perm_tuple in itertools.permutations(orbit):
+            if perm_tuple == tuple(orbit):
+                continue  # Skip identity
+
+            # Build full 10-color permutation array
+            perm = np.arange(PALETTE_C, dtype=np.int64)
+            for idx, orig_c in enumerate(orbit):
+                perm[orig_c] = perm_tuple[idx]
+
+            # Verify: check if np.array_equal(Y_i, np.take(Y_i, perm, axis=None))
+            # Actually need to permute color values, not indices
+            # For grid Y where Y[r,c] = color_value, applying permutation means:
+            # Y_perm[r,c] = perm[Y[r,c]] for each pixel
+
+            is_verified = True
+            for Y in aligned_outputs:
+                # Apply permutation to color values
+                Y_perm = perm[Y]
+                if not np.array_equal(Y, Y_perm):
+                    is_verified = False
+                    break
+
+            if is_verified:
+                verified_symmetries.append({
+                    "type": "perm",
+                    "perm": perm.tolist(),
+                    "verified_all_trainings": True
+                })
+
+    return verified_symmetries
+
+
 def run_stage_wo3(data_root: Path, strict: bool = False, enable_progress: bool = True) -> None:
     """Run WO-3 stage: color signatures and Hungarian alignment.
 
@@ -677,6 +758,9 @@ def run_stage_wo3(data_root: Path, strict: bool = False, enable_progress: bool =
             aligned_outputs, perms, sigs, canonical_sigs, cost_hashes, total_costs = \
                 color_align_module.align_colors(embedded_outputs, bin_ids, num_bins)
 
+            # Detect and verify color symmetries (post-alignment)
+            verified_color_symmetries = detect_verified_color_symmetries(aligned_outputs)
+
             # Check Hungarian bijection for all permutations
             permutation_is_bijection = True
             for perm in perms:
@@ -725,6 +809,7 @@ def run_stage_wo3(data_root: Path, strict: bool = False, enable_progress: bool =
                     }
                     for i in range(len(perms))
                 ],
+                "verified_color_symmetries": verified_color_symmetries,
                 "determinism": {
                     "tie_encoded": tie_encoded,
                     "permutation_is_bijection": permutation_is_bijection,
@@ -1420,41 +1505,36 @@ def run_stage_wo6(data_root: Path, strict: bool = False, enable_progress: bool =
             free_map_candidates = []
 
             # 1. From WO-2: periods (torus rolls) - only if verified
-            if "periods" in wo2_receipt:
-                p_y = wo2_receipt["periods"]["p_y"]
-                p_x = wo2_receipt["periods"]["p_x"]
+            periods = wo2_receipt.get("periods", {})
+            p_y = periods.get("p_y", H_out)
+            p_x = periods.get("p_x", W_out)
+            eq_check_y = periods.get("eq_check_y", False)
+            eq_check_x = periods.get("eq_check_x", False)
 
-                # Check verification flags (eq_check_x, eq_check_y)
-                eq_check_y = wo2_receipt.get("eq_check_y", False)
-                eq_check_x = wo2_receipt.get("eq_check_x", False)
+            # Add non-trivial periods as FREE map candidates ONLY if verified
+            if p_y < H_out and eq_check_y:
+                free_map_candidates.append({
+                    "type": "roll",
+                    "dy": int(p_y),
+                    "dx": 0,
+                    "verified_all_trainings": True,
+                    "source": "wo2_period_y_verified"
+                })
 
-                # Add non-trivial periods as FREE map candidates ONLY if verified
-                if p_y < H_out and eq_check_y:
-                    free_map_candidates.append({
-                        "type": "roll",
-                        "dy": int(p_y),
-                        "dx": 0,
-                        "source": "wo2_period_y_verified"
-                    })
+            if p_x < W_out and eq_check_x:
+                free_map_candidates.append({
+                    "type": "roll",
+                    "dy": 0,
+                    "dx": int(p_x),
+                    "verified_all_trainings": True,
+                    "source": "wo2_period_x_verified"
+                })
 
-                if p_x < W_out and eq_check_x:
-                    free_map_candidates.append({
-                        "type": "roll",
-                        "dy": 0,
-                        "dx": int(p_x),
-                        "source": "wo2_period_x_verified"
-                    })
-
-            # 2. From WO-3: color symmetries (channel permutations)
-            if "hungarian" in wo3_receipt:
-                for hungarian_entry in wo3_receipt["hungarian"]:
-                    if "perm" in hungarian_entry:
-                        perm = hungarian_entry["perm"]
-                        free_map_candidates.append({
-                            "type": "perm",
-                            "perm": perm,
-                            "source": "wo3_hungarian"
-                        })
+            # 2. From WO-3: verified color symmetries (NOT Hungarian alignments)
+            # Hungarian permutations are alignment transforms, not symmetries
+            # Only consume verified symmetries that pass byte-exact equality on all trainings
+            verified_symmetries = wo3_receipt.get("verified_color_symmetries", [])
+            free_map_candidates.extend(verified_symmetries)
 
             # === CHECK FREE PREDICATE ===
             free_checks = []
