@@ -1632,8 +1632,12 @@ def run_stage_wo6(data_root: Path, strict: bool = False, enable_progress: bool =
             free_count = sum(1 for check in free_checks if check["is_free"])
 
             # Accumulate progress metrics: track cost and constraint invariance separately
-            all_cost_ok = all(check["cost_invariance"] for check in free_checks) if free_checks else True
-            all_constraint_ok = all(check["constraint_invariance"] for check in free_checks) if free_checks else True
+            # Per reviewer: only evaluate accepted FREE maps (is_free=True), not rejected candidates
+            # This avoids penalizing correct rejections (e.g., period rolls with incompatible equalizers)
+            # Vacuously True if no FREE maps found (checking completed, just nothing passed both tests)
+            free_maps = [c for c in free_checks if c["is_free"]]
+            all_cost_ok = all(c["cost_invariance"] for c in free_maps) if free_maps else True
+            all_constraint_ok = all(c["constraint_invariance"] for c in free_maps) if free_maps else True
             acc_bool(progress, "free_cost_invariance_ok", all_cost_ok)
             acc_bool(progress, "free_constraint_invariance_ok", all_constraint_ok)
 
