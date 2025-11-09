@@ -213,3 +213,6 @@ progress/
 receipts_backup/
 receipts.backup_pre_wo5/
 receipts_wo3_run1/
+
+# WO artifact cache (materialized arrays for fast iteration)
+.cache/
