@@ -84,9 +84,8 @@ def build_equalizer_rows(
             # Create adjacency graph (4-neighborhood on 2D canvas)
             num_allowed = len(allowed_pixels)
 
-            if num_allowed == 1:
-                # Single pixel, no edges needed
-                equalizer_edges[(s, c)] = []
+            if num_allowed < 2:
+                # Skip singletons - no equalizer needed (don't mark as constant-on-bin)
                 continue
 
             # Build adjacency matrix for allowed pixels

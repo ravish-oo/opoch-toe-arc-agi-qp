@@ -28,6 +28,7 @@ from . import embed as embed_module
 from . import color_align as color_align_module
 from . import mask as mask_module
 from . import eqs as eqs_module
+from . import cache as cache_module
 from .utils import hash_utils
 from .config import GRID_DTYPE, PALETTE_C
 
@@ -178,7 +179,7 @@ def load_task_data(data_root: Path, task_id: str) -> Dict[str, Any]:
     raise FileNotFoundError(f"Task {task_id} not found in any ARC file")
 
 
-def run_stage_wo0(data_root: Path, strict: bool = False, enable_progress: bool = True) -> None:
+def run_stage_wo0(data_root: Path, strict: bool = False, enable_progress: bool = True, filter_tasks: Set[str] = None) -> None:
     """Run WO-0 stage: environment validation and receipt emission.
 
     Args:
@@ -195,6 +196,9 @@ def run_stage_wo0(data_root: Path, strict: bool = False, enable_progress: bool =
     # Discover task IDs
     print(f"[WO-0] Discovering tasks in {data_root}...", file=sys.stderr)
     task_ids = discover_task_ids(data_root)
+    # Apply filter if provided
+    if filter_tasks:
+        task_ids = task_ids & filter_tasks
     print(f"[WO-0] Found {len(task_ids)} tasks", file=sys.stderr)
 
     # Initialize progress tracking
@@ -240,7 +244,7 @@ def run_stage_wo0(data_root: Path, strict: bool = False, enable_progress: bool =
         sys.exit(1)
 
 
-def run_stage_wo1(data_root: Path, strict: bool = False, enable_progress: bool = True) -> None:
+def run_stage_wo1(data_root: Path, strict: bool = False, enable_progress: bool = True, filter_tasks: Set[str] = None) -> None:
     """Run WO-1 stage: bins, bbox, center predicate.
 
     Args:
@@ -258,6 +262,9 @@ def run_stage_wo1(data_root: Path, strict: bool = False, enable_progress: bool =
     # Discover task IDs
     print(f"[WO-1] Discovering tasks in {data_root}...", file=sys.stderr)
     task_ids = discover_task_ids(data_root)
+    # Apply filter if provided
+    if filter_tasks:
+        task_ids = task_ids & filter_tasks
     print(f"[WO-1] Found {len(task_ids)} tasks", file=sys.stderr)
 
     # Initialize progress tracking
@@ -437,7 +444,7 @@ def run_stage_wo1(data_root: Path, strict: bool = False, enable_progress: bool =
         sys.exit(1)
 
 
-def run_stage_wo2(data_root: Path, strict: bool = False, enable_progress: bool = True) -> None:
+def run_stage_wo2(data_root: Path, strict: bool = False, enable_progress: bool = True, filter_tasks: Set[str] = None) -> None:
     """Run WO-2 stage: embedding and period tests.
 
     Args:
@@ -455,6 +462,9 @@ def run_stage_wo2(data_root: Path, strict: bool = False, enable_progress: bool =
     # Discover task IDs
     print(f"[WO-2] Discovering tasks in {data_root}...", file=sys.stderr)
     task_ids = discover_task_ids(data_root)
+    # Apply filter if provided
+    if filter_tasks:
+        task_ids = task_ids & filter_tasks
     print(f"[WO-2] Found {len(task_ids)} tasks", file=sys.stderr)
 
     # Initialize progress tracking
@@ -678,7 +688,7 @@ def detect_verified_color_symmetries(aligned_outputs: list[np.ndarray]) -> list[
     return verified_symmetries
 
 
-def run_stage_wo3(data_root: Path, strict: bool = False, enable_progress: bool = True) -> None:
+def run_stage_wo3(data_root: Path, strict: bool = False, enable_progress: bool = True, filter_tasks: Set[str] = None) -> None:
     """Run WO-3 stage: color signatures and Hungarian alignment.
 
     Args:
@@ -696,6 +706,9 @@ def run_stage_wo3(data_root: Path, strict: bool = False, enable_progress: bool =
     # Discover task IDs
     print(f"[WO-3] Discovering tasks in {data_root}...", file=sys.stderr)
     task_ids = discover_task_ids(data_root)
+    # Apply filter if provided
+    if filter_tasks:
+        task_ids = task_ids & filter_tasks
     print(f"[WO-3] Found {len(task_ids)} tasks", file=sys.stderr)
 
     # Initialize progress tracking
@@ -849,7 +862,7 @@ def run_stage_wo3(data_root: Path, strict: bool = False, enable_progress: bool =
         sys.exit(1)
 
 
-def run_stage_wo4(data_root: Path, strict: bool = False, enable_progress: bool = True) -> None:
+def run_stage_wo4(data_root: Path, strict: bool = False, enable_progress: bool = True, filter_tasks: Set[str] = None) -> None:
     """Run WO-4 stage: forward meet closure and color-agnostic lift.
 
     Args:
@@ -866,6 +879,9 @@ def run_stage_wo4(data_root: Path, strict: bool = False, enable_progress: bool =
     # Discover task IDs
     print(f"[WO-4] Discovering tasks in {data_root}...", file=sys.stderr)
     task_ids = discover_task_ids(data_root)
+    # Apply filter if provided
+    if filter_tasks:
+        task_ids = task_ids & filter_tasks
     print(f"[WO-4] Found {len(task_ids)} tasks", file=sys.stderr)
 
     # Initialize progress tracking
@@ -1099,6 +1115,21 @@ def run_stage_wo4(data_root: Path, strict: bool = False, enable_progress: bool =
                 A_mask=A.astype(np.uint8),
             )
 
+            # Save to cache for fast WO-7 iteration
+            cache_artifacts = {
+                "aligned_outputs": np.array(aligned_outputs, dtype=GRID_DTYPE),
+                "F_mask": F_with_lift.astype(np.uint8),
+                "A_mask": A.astype(np.uint8),
+                "bin_ids": bin_ids,
+            }
+            cache_metadata = {
+                "H": H_out,
+                "W": W_out,
+                "C": PALETTE_C,
+                "N": H_out * W_out,
+            }
+            cache_module.save_cache(4, task_id, data_root, cache_artifacts, cache_metadata)
+
             success_count += 1
             progress["tasks_ok"] += 1
             if success_count % 100 == 0:
@@ -1130,7 +1161,7 @@ def run_stage_wo4(data_root: Path, strict: bool = False, enable_progress: bool =
         sys.exit(1)
 
 
-def run_stage_wo5(data_root: Path, strict: bool = False, enable_progress: bool = True) -> None:
+def run_stage_wo5(data_root: Path, strict: bool = False, enable_progress: bool = True, filter_tasks: Set[str] = None) -> None:
     """WO-5: Equalizers & structure rows (no solving).
 
     Builds:
@@ -1151,6 +1182,9 @@ def run_stage_wo5(data_root: Path, strict: bool = False, enable_progress: bool =
 
     # Discover tasks
     task_ids = discover_task_ids(data_root)
+    # Apply filter if provided
+    if filter_tasks:
+        task_ids = task_ids & filter_tasks
     print(f"[WO-5] Found {len(task_ids)} tasks", file=sys.stderr)
 
     # Create receipts directory
@@ -1347,6 +1381,72 @@ def run_stage_wo5(data_root: Path, strict: bool = False, enable_progress: bool =
             with open(wo5_receipt_path, "w") as f:
                 json.dump(payload, f, indent=2)
 
+            # Save to cache for fast WO-7 iteration
+            # Convert equalizer_edges dict to serializable format
+            # NEW FORMAT: Use "eq_{s}_{c}" prefix and filter empty arrays to prevent stale cache keys
+            equalizer_edges_serialized = {}
+            for (s, c), edges in equalizer_edges.items():
+                edges_arr = np.array(edges, dtype=np.int64)
+                # Only save non-empty equalizer trees (|S| >= 2 means at least 1 edge)
+                if edges_arr.shape[0] >= 1:
+                    key = f"eq_{s}_{c}"  # Unambiguous prefix format
+                    equalizer_edges_serialized[key] = edges_arr
+
+            # Convert gravity_rows to array
+            gravity_rows_array = np.array(gravity_rows, dtype=np.int64) if gravity_rows else np.array([], dtype=np.int64).reshape(0, 2)
+
+            # Compute quotas from training outputs per Anchor 00 §8
+            # q[s,c] = min_i #{p∈B_s: Y_i(p)=c}
+            # "Minimum across training outputs of pixels in bin s assigned color c"
+            quotas_dict = {}
+            for c in range(10):  # PALETTE_C = 10
+                for s, bin_pixels in enumerate(bins_list):
+                    # Count assignments in each training output
+                    counts_per_example = []
+                    for Y_i in train_outputs_aligned:
+                        # Count pixels in bin s assigned color c in this training output
+                        count_in_output = sum(1 for p in bin_pixels if Y_i.flat[p] == c)
+                        counts_per_example.append(count_in_output)
+
+                    # Take minimum across training examples (conservative estimate)
+                    quota = min(counts_per_example) if counts_per_example else 0
+                    quotas_dict[(s, c)] = quota
+
+            # Serialize quotas
+            quotas_array = np.array([[s, c, quotas_dict[(s, c)]] for (s, c) in sorted(quotas_dict.keys())], dtype=np.int64)
+
+            # Build cell_caps from equalizers/gravity (for now, use simple formula)
+            # In WO-7 baseline, each cell can have C colors
+            cell_caps = np.full((H_out, W_out), 10, dtype=np.int32)  # C = 10
+
+            # Compute A_hash for cache validation
+            A_hash = hash_utils.hash_ndarray_int(
+                A_mask.view(np.uint8).reshape(-1)
+            )
+
+            cache_artifacts = {
+                "num_bins": np.array([num_bins], dtype=np.int32),
+                "walls_mask": walls_mask.astype(np.uint8),
+                "gravity_rows": gravity_rows_array,
+                "quotas": quotas_array,
+                "cell_caps": cell_caps,
+                "_A_hash_used": np.array([ord(c) for c in A_hash], dtype=np.uint8),  # Store hash as array
+                "_cache_version": np.array([1], dtype=np.int32),  # Track cache format version
+                **equalizer_edges_serialized,  # Unpack equalizer edges as separate arrays
+            }
+
+            cache_metadata = {
+                "H": H_out,
+                "W": W_out,
+                "C": 10,
+                "N": N,
+                "num_bins": num_bins,
+                "equalizer_keys": list(equalizer_edges.keys()),  # Save keys for reconstruction
+                "A_hash_used": A_hash,  # Store hash string in metadata for easy access
+            }
+
+            cache_module.save_cache(5, task_id, data_root, cache_artifacts, cache_metadata)
+
             success_count += 1
 
             # Progress reporting
@@ -1376,7 +1476,7 @@ def run_stage_wo5(data_root: Path, strict: bool = False, enable_progress: bool =
         sys.exit(1)
 
 
-def run_stage_wo6(data_root: Path, strict: bool = False, enable_progress: bool = True) -> None:
+def run_stage_wo6(data_root: Path, strict: bool = False, enable_progress: bool = True, filter_tasks: Set[str] = None) -> None:
     """WO-6: Π-safe Scores and FREE Predicate
 
     Builds:
@@ -1398,6 +1498,9 @@ def run_stage_wo6(data_root: Path, strict: bool = False, enable_progress: bool =
 
     # Discover tasks
     task_ids = discover_task_ids(data_root)
+    # Apply filter if provided
+    if filter_tasks:
+        task_ids = task_ids & filter_tasks
     print(f"[WO-6] Found {len(task_ids)} tasks", file=sys.stderr)
 
     # Create receipts directory
@@ -1684,6 +1787,18 @@ def run_stage_wo6(data_root: Path, strict: bool = False, enable_progress: bool =
             with open(wo6_receipt_path, "w") as f:
                 json.dump(payload, f, indent=2)
 
+            # Save to cache for fast WO-7 iteration
+            cache_artifacts = {
+                "costs": costs.astype(np.int64),
+            }
+            cache_metadata = {
+                "H": H_out,
+                "W": W_out,
+                "C": C,
+                "N": N,
+            }
+            cache_module.save_cache(6, task_id, data_root, cache_artifacts, cache_metadata)
+
             success_count += 1
 
             # Progress reporting
@@ -1708,6 +1823,127 @@ def run_stage_wo6(data_root: Path, strict: bool = False, enable_progress: bool =
     if enable_progress:
         receipts.write_run_progress(progress)
         print(f"[WO-6] Progress written to progress/progress_wo06.json", file=sys.stderr)
+
+    if fail_count > 0 and strict:
+        sys.exit(1)
+
+
+def run_stage_wo7(data_root: Path, strict: bool = False, enable_progress: bool = True, filter_tasks: Set[str] = None) -> None:
+    """WO-7: Unified Min-Cost Flow
+
+    Builds:
+    - Unified min-cost flow graph per color using OR-Tools SimpleMinCostFlow
+    - Graph nodes: U[s,c] (bins), P[p] (pixels), C[r,j] (cells), T (sink)
+    - Graph arcs: enforce mask, bin quotas, one-of-10, cell capacities
+    - Integer costs from WO-06
+
+    Checks:
+    - Primal feasibility (node balance, capacity constraints)
+    - Cost equality (recomputed cost = solver OptimalCost)
+    - Idempotence (resolving yields identical flows)
+    - Optional KKT conditions
+    """
+    print("[WO-7] Building unified min-cost flow graphs...", file=sys.stderr)
+
+    # Import required modules
+    from arcsolver import flows as flows_module
+
+    # Initialize progress
+    progress = init_progress(7)
+
+    # Discover tasks
+    task_ids = discover_task_ids(data_root)
+    # Apply filter if provided
+    if filter_tasks:
+        task_ids = task_ids & filter_tasks
+    print(f"[WO-7] Found {len(task_ids)} tasks", file=sys.stderr)
+
+    # Create receipts directory
+    receipts_dir = Path("receipts")
+    receipts_dir.mkdir(exist_ok=True)
+
+    success_count = 0
+    fail_count = 0
+
+    for task_id in sorted(task_ids):
+        try:
+            task_dir = receipts_dir / task_id
+
+            # Check that required prior WOs exist
+            required_wos = [0, 1, 2, 3, 4, 5, 6]
+            for wo in required_wos:
+                wo_receipt_path = task_dir / f"wo{wo:02d}.json"
+                if not wo_receipt_path.exists():
+                    raise FileNotFoundError(f"WO-{wo} receipt not found: {wo_receipt_path}")
+
+            # Run WO-7 flow solver
+            receipt = flows_module.run_wo7_for_task(task_dir)
+
+            # Write receipt
+            wo7_receipt_path = task_dir / "wo07.json"
+            with open(wo7_receipt_path, "w") as f:
+                json.dump(receipt, f, indent=2)
+
+            # Extract metrics from solve section
+            solve_data = receipt["solve"]
+
+            # flow_feasible_ok = all primal checks pass
+            flow_feasible_ok = (
+                solve_data.get("primal_balance_ok", False) and
+                solve_data.get("capacity_ok", False) and
+                solve_data.get("mask_ok", False) and
+                solve_data.get("cell_caps_ok", False)
+            )
+
+            # kkt_ok (may be None if not implemented)
+            kkt_ok = solve_data.get("kkt_reduced_cost_ok", False)
+            if kkt_ok is None:
+                kkt_ok = True  # Treat None as vacuously true
+
+            # one_of_10_ok
+            one_of_10_ok = solve_data.get("one_of_10_ok", False)
+
+            # cost_equal_ok (recomputed cost matches optimal cost)
+            cost_equal_ok = solve_data.get("recomputed_cost_ok", False)
+
+            # faces_ok (faces consistency check)
+            faces_ok = solve_data.get("faces_ok", False)
+
+            # idempotence_ok (rebuilt graph produces identical flows)
+            idempotence_ok = solve_data.get("idempotence_ok", False)
+
+            # Accumulate metrics
+            acc_bool(progress, "flow_feasible_ok", flow_feasible_ok)
+            acc_bool(progress, "kkt_ok", kkt_ok)
+            acc_bool(progress, "one_of_10_ok", one_of_10_ok)
+            acc_bool(progress, "cost_equal_ok", cost_equal_ok)
+            acc_bool(progress, "faces_ok", faces_ok)
+            acc_bool(progress, "idempotence_ok", idempotence_ok)
+
+            success_count += 1
+
+            # Progress reporting
+            if enable_progress and success_count % 100 == 0:
+                print(f"[WO-7] Progress: {success_count}/{len(task_ids)} receipts written", file=sys.stderr)
+
+        except Exception as e:
+            print(f"[WO-7] Failed to process task {task_id}: {e}", file=sys.stderr)
+            if fail_count < 2:  # Print traceback for first 2 errors only
+                traceback.print_exc(file=sys.stderr)
+            fail_count += 1
+            if strict:
+                raise
+
+    # Summary
+    print(
+        f"[WO-7] Complete: {success_count} receipts written, {fail_count} failures",
+        file=sys.stderr,
+    )
+
+    # Write progress
+    if enable_progress:
+        receipts.write_run_progress(progress)
+        print(f"[WO-7] Progress written to progress/progress_wo07.json", file=sys.stderr)
 
     if fail_count > 0 and strict:
         sys.exit(1)
@@ -1756,8 +1992,20 @@ Examples:
         action="store_false",
         help="Disable progress JSON writing",
     )
+    parser.add_argument(
+        "--filter-tasks",
+        type=str,
+        default=None,
+        help="Comma-separated list of task IDs to process (e.g., '00576224,007bbfb7')",
+    )
 
     args = parser.parse_args()
+
+    # Parse filter tasks if provided
+    filter_tasks = None
+    if args.filter_tasks:
+        filter_tasks = set(args.filter_tasks.split(","))
+        print(f"[harness] Filtering to {len(filter_tasks)} tasks: {sorted(filter_tasks)}", file=sys.stderr)
 
     # Validate work order
     if args.upto_wo < 0:
@@ -1773,6 +2021,7 @@ Examples:
         4: run_stage_wo4,
         5: run_stage_wo5,
         6: run_stage_wo6,
+        7: run_stage_wo7,
     }
 
     # Run stages
@@ -1783,7 +2032,7 @@ Examples:
 
     for wo in range(args.upto_wo + 1):
         if wo in STAGE_RUNNERS:
-            STAGE_RUNNERS[wo](args.data_root, strict=args.strict, enable_progress=args.progress)
+            STAGE_RUNNERS[wo](args.data_root, strict=args.strict, enable_progress=args.progress, filter_tasks=filter_tasks)
         else:
             print(
                 f"[harness] WO-{wo} not implemented yet (available: {sorted(STAGE_RUNNERS.keys())})",
