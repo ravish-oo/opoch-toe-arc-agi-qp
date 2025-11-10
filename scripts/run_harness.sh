@@ -59,6 +59,7 @@ DATA_ROOT="${DATA_ROOT:-data}"
 UPTO_WO=""
 STRICT_FLAG=""
 PROGRESS_FLAG="--progress"
+FILTER_TASKS_FLAG=""
 
 # Parse args
 while [[ $# -gt 0 ]]; do
@@ -83,9 +84,13 @@ while [[ $# -gt 0 ]]; do
             PROGRESS_FLAG="--no-progress"
             shift
             ;;
+        --filter-tasks)
+            FILTER_TASKS_FLAG="--filter-tasks $2"
+            shift 2
+            ;;
         *)
             echo "Unknown argument: $1" >&2
-            echo "Usage: $0 [--upto-wo N] [--strict] [--data-root DIR] [--progress|--no-progress]" >&2
+            echo "Usage: $0 [--upto-wo N] [--strict] [--data-root DIR] [--progress|--no-progress] [--filter-tasks TASK_IDS]" >&2
             exit 1
             ;;
     esac
@@ -98,9 +103,10 @@ if [[ -z "${UPTO_WO}" ]]; then
     exit 1
 fi
 
-echo "[run_harness] Running: python -m arcsolver.harness --data-root ${DATA_ROOT} --upto-wo ${UPTO_WO} ${STRICT_FLAG} ${PROGRESS_FLAG}" >&2
+echo "[run_harness] Running: python -m arcsolver.harness --data-root ${DATA_ROOT} --upto-wo ${UPTO_WO} ${STRICT_FLAG} ${PROGRESS_FLAG} ${FILTER_TASKS_FLAG}" >&2
 exec python -m arcsolver.harness \
     --data-root "${DATA_ROOT}" \
     --upto-wo "${UPTO_WO}" \
     ${STRICT_FLAG} \
-    ${PROGRESS_FLAG}
+    ${PROGRESS_FLAG} \
+    ${FILTER_TASKS_FLAG}
