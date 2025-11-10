@@ -44,7 +44,7 @@ WO_METRICS = {
     5: ["commuting_rows_ok", "gravity_rows_unique_ok", "harmonic_rows_built_ok"],
     6: ["free_cost_invariance_ok", "free_constraint_invariance_ok"],
     7: ["flow_feasible_ok", "kkt_ok", "one_of_10_ok"],
-    8: ["idempotence_ok", "bits_sum"],
+    8: ["decode_one_of_10_ok", "decode_mask_ok", "bit_meter_check_ok", "idempotence_ok", "bits_sum"],
     9: ["laminar_confluence_ok", "iis_count"],
 }
 
@@ -1949,6 +1949,119 @@ def run_stage_wo7(data_root: Path, strict: bool = False, enable_progress: bool =
         sys.exit(1)
 
 
+def run_stage_wo8(data_root: Path, strict: bool = False, enable_progress: bool = True, filter_tasks: Set[str] = None) -> None:
+    """
+    WO-8: Decode + Bit-meter
+
+    Loads WO-7 flows and produces final prediction grid plus bit-meter.
+    """
+    from . import stages_wo08
+    from .decode import run_synthetic_tie_tests, verify_idempotence_on_tasks
+
+    # Initialize progress
+    progress = init_progress(8)
+
+    # Discover tasks
+    task_ids = discover_task_ids(data_root)
+    # Apply filter if provided
+    if filter_tasks:
+        task_ids = task_ids & filter_tasks
+    print(f"[WO-8] Found {len(task_ids)} tasks", file=sys.stderr)
+
+    # Run synthetic tie tests once (per WO-08 §7)
+    print(f"[WO-8] Running synthetic tie tests for bit-meter validation...", file=sys.stderr)
+    bit_meter_check_ok = run_synthetic_tie_tests()
+    if bit_meter_check_ok:
+        print(f"[WO-8] ✓ Synthetic tie tests passed (m ∈ {{1,2,3,4}})", file=sys.stderr)
+    else:
+        print(f"[WO-8] ✗ Synthetic tie tests FAILED", file=sys.stderr)
+        if strict:
+            raise RuntimeError("WO-8 synthetic tie tests failed")
+
+    # Run idempotence verification on sample tasks (per WO-08 §7)
+    sample_task_ids = sorted(task_ids)[:4]  # Test on first 4 tasks
+    if len(sample_task_ids) > 0:
+        print(f"[WO-8] Running idempotence verification on {len(sample_task_ids)} sample tasks...", file=sys.stderr)
+        idempotence_ok, failed_tasks = verify_idempotence_on_tasks(sample_task_ids, data_root)
+        if idempotence_ok:
+            print(f"[WO-8] ✓ Idempotence verified: all {len(sample_task_ids)} tasks produced identical outputs on re-run", file=sys.stderr)
+        else:
+            print(f"[WO-8] ✗ Idempotence check FAILED on {len(failed_tasks)} tasks: {failed_tasks}", file=sys.stderr)
+            if strict:
+                raise RuntimeError(f"WO-8 idempotence verification failed: {failed_tasks}")
+    else:
+        print(f"[WO-8] ⚠ No tasks available for idempotence verification", file=sys.stderr)
+        idempotence_ok = True  # Default to True if no tasks to test
+
+    success_count = 0
+    fail_count = 0
+
+    for task_id in sorted(task_ids):
+        try:
+            # Check that required prior WOs exist
+            receipts_dir = Path("receipts")
+            task_dir = receipts_dir / task_id
+            required_wos = [0, 1, 2, 3, 4, 5, 6, 7]
+            for wo in required_wos:
+                wo_receipt_path = task_dir / f"wo{wo:02d}.json"
+                if not wo_receipt_path.exists():
+                    raise FileNotFoundError(f"WO-{wo} receipt not found: {wo_receipt_path}")
+
+            # Run WO-8 decode + bit-meter (writes receipt itself)
+            receipt = stages_wo08.run_wo08(task_id, data_root)
+
+            # Extract metrics from receipt
+            decode_data = receipt["decode"]
+            bit_meter_data = receipt["bit_meter"]
+
+            # Individual decode checks (per WO-08 §6 requirements)
+            decode_one_of_10_ok = decode_data.get("one_of_10_decode_ok", False)
+            decode_mask_ok = decode_data.get("mask_ok", False)
+
+            # bits_sum = total_bits from bit-meter
+            bits_sum = bit_meter_data.get("total_bits", 0)
+
+            # Accumulate individual metrics
+            acc_bool(progress, "decode_one_of_10_ok", decode_one_of_10_ok)
+            acc_bool(progress, "decode_mask_ok", decode_mask_ok)
+
+            # Synthetic tie tests (run once at function start per WO-08 §7)
+            acc_bool(progress, "bit_meter_check_ok", bit_meter_check_ok)
+
+            # Idempotence verification (run once at function start per WO-08 §7)
+            acc_bool(progress, "idempotence_ok", idempotence_ok)
+
+            acc_sum(progress, "bits_sum", bits_sum)
+
+            success_count += 1
+
+            # Progress reporting
+            if enable_progress and success_count % 100 == 0:
+                print(f"[WO-8] Progress: {success_count}/{len(task_ids)} receipts written", file=sys.stderr)
+
+        except Exception as e:
+            print(f"[WO-8] Failed to process task {task_id}: {e}", file=sys.stderr)
+            if fail_count < 2:  # Print traceback for first 2 errors only
+                traceback.print_exc(file=sys.stderr)
+            fail_count += 1
+            if strict:
+                raise
+
+    # Summary
+    print(
+        f"[WO-8] Complete: {success_count} receipts written, {fail_count} failures",
+        file=sys.stderr,
+    )
+
+    # Write progress
+    if enable_progress:
+        receipts.write_run_progress(progress)
+        print(f"[WO-8] Progress written to progress/progress_wo08.json", file=sys.stderr)
+
+    if fail_count > 0 and strict:
+        sys.exit(1)
+
+
 def main() -> None:
     """CLI entry point for harness."""
     parser = argparse.ArgumentParser(
@@ -2022,6 +2135,7 @@ Examples:
         5: run_stage_wo5,
         6: run_stage_wo6,
         7: run_stage_wo7,
+        8: run_stage_wo8,
     }
 
     # Run stages

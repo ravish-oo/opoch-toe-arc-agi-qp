@@ -99,6 +99,41 @@ def run_wo07(task_id: str, data_root: Path) -> Dict:
         recomputed_cost = None
         recomputed_cost_ok = False
 
+    # Cache bin_to_pixel arc decisions for WO-08 decode
+    cache_dir = data_root.parent / ".cache" / "wo07"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = cache_dir / f"{task_id}.npz"
+
+    if solution["status"] == "OPTIMAL":
+        # Extract bin_to_pixel arcs (these encode x[p,c] decisions)
+        bin_to_pixel = [f for f in solution["flows"] if f.get("type") == "bin_to_pixel"]
+        arcs_p = np.array([a["p"] for a in bin_to_pixel], dtype=np.int32)
+        arcs_c = np.array([a["c"] for a in bin_to_pixel], dtype=np.uint8)
+        arcs_flow = np.array([a["flow"] for a in bin_to_pixel], dtype=np.uint8)
+
+        np.savez_compressed(
+            cache_path,
+            arcs_p=arcs_p,
+            arcs_c=arcs_c,
+            arcs_flow=arcs_flow,
+            N=inputs["N"],
+            C=inputs["C"],
+            H=inputs["H"],
+            W=inputs["W"],
+        )
+    else:
+        # For INFEASIBLE, save empty arrays
+        np.savez_compressed(
+            cache_path,
+            arcs_p=np.array([], dtype=np.int32),
+            arcs_c=np.array([], dtype=np.uint8),
+            arcs_flow=np.array([], dtype=np.uint8),
+            N=inputs["N"],
+            C=inputs["C"],
+            H=inputs["H"],
+            W=inputs["W"],
+        )
+
     # Build receipt per WO-07 spec with precheck and budget preservation
     receipt = {
         "stage": "wo07",
