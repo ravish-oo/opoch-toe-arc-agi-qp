@@ -39,17 +39,18 @@ def infer_failure_tier_from_precheck(
             for c in capacity_conflicts
         )
 
-        # Prefer quota tier if there are any quota conflicts
-        # (even if there are also mask conflicts - quota tier comes first in laminar precedence)
-        if has_quota_conflict:
-            return "quota"
-
-        # If only mask conflicts (all allowed=0), it's hard tier
+        # Check mask conflicts FIRST (allowed==0 means never-relax per §10)
+        # Any mask violation → hard tier (go straight to IIS)
         has_mask_violation = any(c.get("allowed", 0) == 0 for c in capacity_conflicts)
         if has_mask_violation:
             return "hard"
 
-        # Default to quota if neither
+        # Only if NO mask conflicts, check quota-tier conflicts (allowed > 0)
+        # Quota excess with allowed>0 is relaxable by reducing quotas
+        if has_quota_conflict:
+            return "quota"
+
+        # Default to quota if neither (shouldn't happen if capacity_ok=false)
         return "quota"
 
     if not precheck.get("constant_bin_ok", True):
@@ -291,6 +292,10 @@ def reduce_quotas_minimally(
             if A_mask[p, c]:
                 allowed_count += 1
 
+        # Skip mask conflicts (allowed==0) - never relax these per §10
+        if allowed_count == 0:
+            continue
+
         if q > allowed_count:
             drop = q - allowed_count
             new_quotas[(s, c)] = allowed_count
@@ -466,9 +471,19 @@ def build_iis_ddmin(
     )
 
     if len(constraints) == 0:
+        # Compute audit counts for empty IIS (Fix D)
+        mask_count = sum(1 for c in initial_result.precheck.get("capacity_conflicts", []) if c.get("allowed", 0) == 0)
+        eq_count = len(initial_result.precheck.get("eq_conflicts", []))
+        cell_checked = initial_result.solution is not None
+
         return {
             "present": False,
             "note": "No hard-tier constraints identified",
+            "audit": {
+                "mask_conflicts": mask_count,
+                "eq_conflicts": eq_count,
+                "cell_cap_checked": cell_checked,
+            }
         }
 
     # Define FEASIBLE oracle that actually tests feasibility

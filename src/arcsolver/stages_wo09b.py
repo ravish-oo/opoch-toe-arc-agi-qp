@@ -114,8 +114,9 @@ def run_wo09b(task_id: str, data_root: Path) -> Dict:
         current_pack = pack
         current_inputs = base_inputs.copy()
 
-        # Step 1: Try as-is
-        result = relax.try_pack(current_pack, current_inputs, A_mask, bin_ids)
+        # Step 1: Try as-is and capture initial state (for IIS if needed)
+        initial_result = relax.try_pack(current_pack, current_inputs, A_mask, bin_ids)
+        result = initial_result
 
         if result.status == "OPTIMAL" and all([
             result.primal_balance_ok,
@@ -212,13 +213,14 @@ def run_wo09b(task_id: str, data_root: Path) -> Dict:
 
         # Step 3: If still infeasible and hard tier, build IIS
         if result.failure_tier == "hard":
-            # Build IIS (use current_pack and current_inputs which have all relaxations applied)
+            # Build IIS using ORIGINAL pack/inputs to explain why initial problem failed
+            # (not the post-relaxation state - per Fix C)
             iis = relax.build_iis_ddmin(
-                current_pack,
-                current_inputs,
+                pack,  # ORIGINAL pack, not current_pack
+                base_inputs,  # ORIGINAL inputs, not current_inputs
                 A_mask,
                 bin_ids,
-                result,
+                initial_result,  # Has ORIGINAL precheck before relaxations
             )
 
             pack_trial["result"] = {
