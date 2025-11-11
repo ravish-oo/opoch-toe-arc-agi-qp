@@ -46,6 +46,7 @@ WO_METRICS = {
     7: ["flow_feasible_ok", "kkt_ok", "one_of_10_ok"],
     8: ["decode_one_of_10_ok", "decode_mask_ok", "bit_meter_check_ok", "idempotence_ok", "bits_sum"],
     9: ["packs_exist_ok", "packs_deterministic_ok", "quick_checks_ok", "faces_mode_ok"],
+    10: ["pack_choose_ok", "laminar_respects_tiers_ok", "determinism_ok", "iis_present_ok"],
 }
 
 
@@ -2240,6 +2241,181 @@ def run_stage_wo09a(data_root: Path, strict: bool = False, enable_progress: bool
         sys.exit(1)
 
 
+def run_stage_wo09b(data_root: Path, strict: bool = False, enable_progress: bool = True, filter_tasks: Set[str] = None) -> None:
+    """
+    WO-9B: Laminar Greedy Relax + IIS
+
+    For each pack from WO-9A, applies laminar precedence relaxation:
+    1. Try as-is
+    2. Drop faces (if needed)
+    3. Reduce quotas minimally (if needed)
+    4. Build minimal IIS if still infeasible
+
+    Selects first feasible pack or emits IIS certificate.
+    """
+    from . import stages_wo09b
+
+    # Initialize progress
+    progress = init_progress(10)
+
+    # Discover tasks
+    task_ids = discover_task_ids(data_root)
+    # Apply filter if provided
+    if filter_tasks:
+        task_ids = task_ids & filter_tasks
+    print(f"[WO-9B] Found {len(task_ids)} tasks", file=sys.stderr)
+
+    success_count = 0
+    fail_count = 0
+
+    # Track first run hashes for determinism check
+    first_run_hashes = {}
+
+    for task_id in sorted(task_ids):
+        try:
+            # Check that required prior WOs exist
+            receipts_dir = Path("receipts")
+            task_dir = receipts_dir / task_id
+            required_wos = [0, 1, 2, 3, 4, 5, 6, 7, 9]  # Need WO-9A
+            for wo in required_wos:
+                wo_receipt_path = task_dir / f"wo{wo:02d}.json" if wo < 9 else task_dir / "wo09a.json"
+                if not wo_receipt_path.exists():
+                    raise FileNotFoundError(f"WO-{wo} receipt not found: {wo_receipt_path}")
+
+            # Run WO-9B laminar greedy relaxation
+            receipt = stages_wo09b.run_wo09b(task_id, data_root)
+
+            # Store hash for determinism check
+            receipt_hash = receipt.get("hash", "")
+            first_run_hashes[task_id] = receipt_hash
+
+            # Extract metrics from receipt
+            selected_pack_id = receipt.get("selected_pack_id", None)
+            packs_tried = receipt.get("packs_tried", [])
+            iis = receipt.get("iis", None)
+
+            # pack_choose_ok: if any pack is feasible, selected_pack_id exists and selected pack is OPTIMAL
+            if selected_pack_id is not None:
+                # Find the selected pack trial
+                selected_trial = None
+                for trial in packs_tried:
+                    if trial.get("result", {}).get("selected", False):
+                        selected_trial = trial
+                        break
+
+                if selected_trial is not None:
+                    result = selected_trial.get("result", {})
+                    pack_choose_ok = (
+                        result.get("status") == "OPTIMAL" and
+                        result.get("primal_balance_ok", False) and
+                        result.get("capacity_ok", False) and
+                        result.get("cost_equal_ok", False) and
+                        result.get("one_of_10_ok", False)
+                    )
+                else:
+                    pack_choose_ok = False
+            else:
+                pack_choose_ok = (iis is not None and iis.get("present", False))
+
+            acc_bool(progress, "pack_choose_ok", pack_choose_ok)
+
+            # laminar_respects_tiers_ok: verify tier precedence in drops
+            laminar_respects_tiers_ok = True
+            for trial in packs_tried:
+                drops = trial.get("drops", [])
+
+                # Verify no hard tier drops (mask, equalizer, cell)
+                has_hard_drop = any(d.get("tier") in ("mask", "equalizer", "cell") for d in drops)
+                if has_hard_drop:
+                    laminar_respects_tiers_ok = False
+                    break
+
+                # Verify faces drops come before quota drops (laminar order)
+                last_faces_idx = -1
+                first_quota_idx = len(drops)
+
+                for idx, drop in enumerate(drops):
+                    tier = drop.get("tier")
+                    if tier == "faces":
+                        last_faces_idx = idx
+                    elif tier == "quota" and first_quota_idx == len(drops):
+                        first_quota_idx = idx
+
+                # If both exist, last faces must come before first quota
+                if last_faces_idx >= 0 and first_quota_idx < len(drops):
+                    if last_faces_idx >= first_quota_idx:
+                        laminar_respects_tiers_ok = False
+                        break
+
+            acc_bool(progress, "laminar_respects_tiers_ok", laminar_respects_tiers_ok)
+
+            # iis_present_ok: if no feasible pack, IIS must exist
+            if selected_pack_id is None:
+                iis_present_ok = (iis is not None and iis.get("present", False))
+                acc_bool(progress, "iis_present_ok", iis_present_ok)
+            else:
+                # Feasible pack found, IIS check not applicable
+                acc_bool(progress, "iis_present_ok", True)
+
+            success_count += 1
+
+            # Progress reporting
+            if enable_progress and success_count % 100 == 0:
+                print(f"[WO-9B] Progress: {success_count}/{len(task_ids)} receipts written", file=sys.stderr)
+
+        except Exception as e:
+            print(f"[WO-9B] Failed to process task {task_id}: {e}", file=sys.stderr)
+            if fail_count < 2:  # Print traceback for first 2 errors only
+                traceback.print_exc(file=sys.stderr)
+            fail_count += 1
+            if strict:
+                raise
+
+    # Determinism check: re-run 3-5 sample tasks and compare hashes
+    print(f"[WO-9B] Running determinism check on sample tasks...", file=sys.stderr)
+    sample_task_ids = sorted(first_run_hashes.keys())[:min(5, len(first_run_hashes))]
+    deterministic_ok = True
+
+    for task_id in sample_task_ids:
+        try:
+            # Re-run WO-9B
+            rerun_receipt = stages_wo09b.run_wo09b(task_id, data_root)
+            rerun_hash = rerun_receipt.get("hash", "")
+
+            # Compare hashes
+            if rerun_hash != first_run_hashes[task_id]:
+                print(f"[WO-9B] ✗ Determinism check FAILED for {task_id}: hash mismatch", file=sys.stderr)
+                deterministic_ok = False
+                if strict:
+                    raise RuntimeError(f"WO-9B determinism check failed for {task_id}")
+        except Exception as e:
+            print(f"[WO-9B] ✗ Determinism check FAILED for {task_id}: {e}", file=sys.stderr)
+            deterministic_ok = False
+            if strict:
+                raise
+
+    if deterministic_ok:
+        print(f"[WO-9B] ✓ Determinism verified: all {len(sample_task_ids)} sample tasks produced identical hashes", file=sys.stderr)
+
+    # Accumulate determinism metric for ALL tasks
+    for _ in range(success_count):
+        acc_bool(progress, "determinism_ok", deterministic_ok)
+
+    # Summary
+    print(
+        f"[WO-9B] Complete: {success_count} receipts written, {fail_count} failures",
+        file=sys.stderr,
+    )
+
+    # Write progress
+    if enable_progress:
+        receipts.write_run_progress(progress)
+        print(f"[WO-9B] Progress written to progress/progress_wo10.json", file=sys.stderr)
+
+    if fail_count > 0 and strict:
+        sys.exit(1)
+
+
 def main() -> None:
     """CLI entry point for harness."""
     parser = argparse.ArgumentParser(
@@ -2315,6 +2491,7 @@ Examples:
         7: run_stage_wo7,
         8: run_stage_wo8,
         9: run_stage_wo09a,
+        10: run_stage_wo09b,
     }
 
     # Run stages

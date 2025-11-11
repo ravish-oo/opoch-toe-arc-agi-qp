@@ -29,6 +29,8 @@
 
 10. **WO-9: Size inference + packs + relax**
     size laws, packs, laminar greedy relaxation; IIS. Tests: UNSAT certificates.
+    # WO-9A — Packs & Size Law
+    # WO-9B — Laminar Greedy Relax + IIS
 
 11. **WO-10: End-to-end Φ + receipts**
     glue all; receipts JSON; golden tests on a fixed ARC subset.
