@@ -38,6 +38,9 @@ def run_wo07(task_id: str, data_root: Path) -> Dict:
     for (s, c), q in quotas_dict.items():
         quotas_array[s, c] = q
 
+    # Calculate supplies_total early (needed for precheck)
+    supplies_total = sum(quotas_dict.values())
+
     # Run pre-check before building solver (§8/§10/§11)
     precheck_result = wo7_precheck(
         H=inputs["H"],
@@ -48,11 +51,15 @@ def run_wo07(task_id: str, data_root: Path) -> Dict:
         eq_rows=inputs.get("equalizer_edges", {}),
     )
 
+    # Add zero_supply check to precheck (Proposal B)
+    precheck_result["zero_supply"] = (supplies_total == 0)
+    if precheck_result["zero_supply"]:
+        precheck_result.setdefault("notes", []).append(
+            "Zero-supply graph: solver will return trivial zero-flow OPTIMAL"
+        )
+
     # Build min-cost flow graph
     mcf, metadata = flows.build_flow_graph(inputs)
-
-    # Calculate supplies_total for budget preservation check
-    supplies_total = sum(quotas_dict.values())
 
     # Solve and extract solution
     solution = flows.solve_and_extract(mcf, metadata)
@@ -141,8 +148,10 @@ def run_wo07(task_id: str, data_root: Path) -> Dict:
             "infeasibility_expected": precheck_result["infeasibility_expected"],
             "capacity_ok": precheck_result["capacity_ok"],
             "constant_bin_ok": precheck_result["constant_bin_ok"],
+            "zero_supply": precheck_result["zero_supply"],
             "capacity_conflicts": precheck_result["capacity_conflicts"][:16],  # Truncate for receipt
             "eq_conflicts": precheck_result["eq_conflicts"][:16],
+            "notes": precheck_result.get("notes", []),
         },
         "graph": {
             "H": inputs["H"],

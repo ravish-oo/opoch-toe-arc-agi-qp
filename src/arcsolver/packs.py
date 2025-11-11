@@ -19,8 +19,13 @@ import numpy as np
 class SizeLaw:
     """Output size law per 00 §1"""
     law: str  # "constant" | "linear" | "content"
-    H: int
-    W: int
+    H: int = 0  # Concrete H for constant laws (0 for parameterized laws)
+    W: int = 0  # Concrete W for constant laws (0 for parameterized laws)
+    # Linear law coefficients (optional, used when law="linear")
+    a_H: Optional[int] = None
+    b_H: Optional[int] = None
+    a_W: Optional[int] = None
+    b_W: Optional[int] = None
     proof_hash: str = ""  # sha256 of proof evidence
 
 
@@ -303,13 +308,21 @@ def pack_to_dict(pack: Pack) -> Dict:
             fm_dict["perm"] = fm.perm
         free_maps_dicts.append(fm_dict)
 
+    # Build size_law dict with optional linear coefficients
+    size_law_dict = {
+        "law": pack.size_law.law,
+        "H": pack.size_law.H,
+        "W": pack.size_law.W,
+    }
+    if pack.size_law.law == "linear":
+        size_law_dict["a_H"] = pack.size_law.a_H
+        size_law_dict["b_H"] = pack.size_law.b_H
+        size_law_dict["a_W"] = pack.size_law.a_W
+        size_law_dict["b_W"] = pack.size_law.b_W
+
     return {
         "pack_id": pack.pack_id,
-        "size_law": {
-            "law": pack.size_law.law,
-            "H": pack.size_law.H,
-            "W": pack.size_law.W,
-        },
+        "size_law": size_law_dict,
         "faces_mode": pack.faces_mode,
         "free_maps": free_maps_dicts,
         "quick": {

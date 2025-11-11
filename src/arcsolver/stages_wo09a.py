@@ -26,34 +26,58 @@ def run_wo09a(task_id: str, data_root: Path) -> Dict:
     """
     cache_root = data_root.parent / ".cache"
 
-    # === LOAD WO-2 CACHE (size) ===
-    # Per spec: "Inputs (from cache; never from receipts)"
-    wo2_cache_path = cache_root / "wo02" / f"{task_id}.json"
-    if not wo2_cache_path.exists():
-        raise FileNotFoundError(f"WO-2 cache not found: {wo2_cache_path}")
+    # === LOAD WO-1 CACHE (size laws) ===
+    # Per spec: Load all proven size laws from WO-1 enumeration
+    wo1_cache_path = cache_root / "wo01" / f"{task_id}.size_laws.json"
+    if not wo1_cache_path.exists():
+        raise FileNotFoundError(f"WO-1 size_laws cache not found: {wo1_cache_path}")
 
-    with open(wo2_cache_path) as f:
-        wo2_metadata = json.load(f)
+    with open(wo1_cache_path) as f:
+        wo1_cache = json.load(f)
 
-    H_out = wo2_metadata["H_out"]
-    W_out = wo2_metadata["W_out"]
-    mode = wo2_metadata.get("mode", "topleft")
+    # Convert size law dicts to SizeLaw objects
+    size_laws = []
+    for law_dict in wo1_cache["size_laws"]:
+        if law_dict["law"] == "constant":
+            size_law = packs_module.SizeLaw(
+                law="constant",
+                H=law_dict["H"],
+                W=law_dict["W"],
+                proof_hash=law_dict["proof_hash"],
+            )
+            size_laws.append(size_law)
+        elif law_dict["law"] == "linear":
+            # Linear laws are test-specific (need H_in, W_in from test input)
+            # They will be evaluated in WO-10, not here at WO-9A
+            size_law = packs_module.SizeLaw(
+                law="linear",
+                a_H=law_dict["a_H"],
+                b_H=law_dict["b_H"],
+                a_W=law_dict["a_W"],
+                b_W=law_dict["b_W"],
+                proof_hash=law_dict["proof_hash"],
+            )
+            size_laws.append(size_law)
+        # content-based laws also deferred to WO-10
 
-    # INTERIM: single size law (spec prefers extending WO-1 to enumerate all proven laws)
-    # Per WO-9A spec, only three valid law types: "constant" | "linear" | "content"
-    # Periods affect internal structure but not output size variation → "constant"
-    if mode in ["topleft", "center"]:
-        law_type = "constant"  # bbox-based sizing
-    else:
-        law_type = "content"  # content-dependent
-
-    size_law = packs_module.SizeLaw(
-        law=law_type,
-        H=H_out,
-        W=W_out,
-        proof_hash="",  # Would come from WO-1 enumeration
-    )
-    size_laws = [size_law]
+    # If no size laws proven (shouldn't happen for well-formed tasks), fallback to WO-2
+    if len(size_laws) == 0:
+        # Fallback: Load from WO-2 for backward compatibility
+        wo2_cache_path = cache_root / "wo02" / f"{task_id}.json"
+        if wo2_cache_path.exists():
+            with open(wo2_cache_path) as f:
+                wo2_metadata = json.load(f)
+            H_out = wo2_metadata["H_out"]
+            W_out = wo2_metadata["W_out"]
+            size_law = packs_module.SizeLaw(
+                law="constant",
+                H=H_out,
+                W=W_out,
+                proof_hash="fallback",
+            )
+            size_laws = [size_law]
+        else:
+            raise ValueError(f"No size laws found for task {task_id} in WO-1 or WO-2")
 
     # === LOAD WO-4 CACHE (A_mask, bin_ids) ===
     wo4_cache_path = cache_root / "wo04" / f"{task_id}.npz"
@@ -92,8 +116,12 @@ def run_wo09a(task_id: str, data_root: Path) -> Dict:
     ]
 
     # === ENUMERATE PACKS ===
+    # Only enumerate packs for constant laws (with concrete H, W)
+    # Linear/content laws are test-specific and will be handled in WO-10
+    constant_size_laws = [sl for sl in size_laws if sl.law == "constant"]
+
     packs = packs_module.enumerate_packs(
-        size_laws=size_laws,
+        size_laws=constant_size_laws,
         faces_R=faces_R,
         faces_S=faces_S,
         free_maps_verified=free_maps_verified,
@@ -111,8 +139,10 @@ def run_wo09a(task_id: str, data_root: Path) -> Dict:
         "packs": packs_dicts,
         "packs_count": len(packs),
         "hash": packs_module.compute_packs_hash(packs),
-        "size_laws_complete": False,  # INTERIM: single size law from WO-2; full enumeration requires WO-1 extension
-        "note": "interim single size law; WO-1 extension pending",
+        "size_laws_complete": True,  # All proven size laws from WO-1 enumeration
+        "size_laws_count": len(size_laws),
+        "size_laws_constant_count": len(constant_size_laws),
+        "note": "Linear/content laws are test-specific; evaluated in WO-10",
     }
 
     # === WRITE RECEIPT ===

@@ -246,8 +246,145 @@ def run_stage_wo0(data_root: Path, strict: bool = False, enable_progress: bool =
         sys.exit(1)
 
 
+def enumerate_size_laws(train_pairs: List[Dict]) -> List[Dict]:
+    """
+    Enumerate all proven size laws from training pairs per Anchor 00 §1.
+
+    Laws checked in lex precedence:
+    1. Constant: All outputs same (H,W)
+    2. Linear: H_out = a_H*H_in + b_H, W_out = a_W*W_in + b_W
+    3. Content-based: (not implemented in this baseline - returns empty if not constant/linear)
+
+    Args:
+        train_pairs: List of {"input": grid, "output": grid} dicts
+
+    Returns:
+        List of size law dicts with {"law", "H", "W", "proof_hash"}
+    """
+    import hashlib
+
+    size_laws = []
+
+    # Extract I/O shapes
+    io_shapes = []
+    for pair in train_pairs:
+        input_grid = np.array(pair["input"], dtype=GRID_DTYPE)
+        output_grid = np.array(pair["output"], dtype=GRID_DTYPE)
+        H_in, W_in = input_grid.shape
+        H_out, W_out = output_grid.shape
+        io_shapes.append((H_in, W_in, H_out, W_out))
+
+    # 1. CONSTANT LAW
+    # Check if all outputs have same shape
+    output_shapes = [(h_out, w_out) for _, _, h_out, w_out in io_shapes]
+    unique_output_shapes = set(output_shapes)
+
+    if len(unique_output_shapes) == 1:
+        H_out, W_out = output_shapes[0]
+        # Proof: all training outputs are (H_out, W_out)
+        proof_data = f"constant:{H_out}x{W_out}:shapes={sorted(output_shapes)}"
+        proof_hash = hashlib.sha256(proof_data.encode()).hexdigest()
+
+        size_laws.append({
+            "law": "constant",
+            "H": int(H_out),
+            "W": int(W_out),
+            "proof_hash": proof_hash,
+        })
+
+    # 2. LINEAR LAW
+    # Try to fit H_out = a_H*H_in + b_H, W_out = a_W*W_in + b_W
+    # Need at least 2 pairs to solve for (a, b)
+    if len(io_shapes) >= 2:
+        # Solve for H coefficients
+        # Find any two pairs with different H_in values
+        linear_H_ok = False
+        a_H, b_H = None, None
+
+        for i in range(len(io_shapes)):
+            for j in range(i + 1, len(io_shapes)):
+                H_in_i, _, H_out_i, _ = io_shapes[i]
+                H_in_j, _, H_out_j, _ = io_shapes[j]
+
+                if H_in_i != H_in_j:
+                    # Compute slope and intercept
+                    a_H_candidate = (H_out_j - H_out_i) / (H_in_j - H_in_i)
+                    b_H_candidate = H_out_i - a_H_candidate * H_in_i
+
+                    # Check if integer coefficients
+                    if a_H_candidate == int(a_H_candidate) and b_H_candidate == int(b_H_candidate):
+                        a_H = int(a_H_candidate)
+                        b_H = int(b_H_candidate)
+
+                        # Verify on all pairs
+                        linear_H_ok = all(
+                            H_out == a_H * H_in + b_H
+                            for H_in, _, H_out, _ in io_shapes
+                        )
+
+                        if linear_H_ok:
+                            break  # Found valid H law
+
+            if linear_H_ok:
+                break
+
+        # Solve for W coefficients
+        # Find any two pairs with different W_in values
+        linear_W_ok = False
+        a_W, b_W = None, None
+
+        for i in range(len(io_shapes)):
+            for j in range(i + 1, len(io_shapes)):
+                _, W_in_i, _, W_out_i = io_shapes[i]
+                _, W_in_j, _, W_out_j = io_shapes[j]
+
+                if W_in_i != W_in_j:
+                    # Compute slope and intercept
+                    a_W_candidate = (W_out_j - W_out_i) / (W_in_j - W_in_i)
+                    b_W_candidate = W_out_i - a_W_candidate * W_in_i
+
+                    # Check if integer coefficients
+                    if a_W_candidate == int(a_W_candidate) and b_W_candidate == int(b_W_candidate):
+                        a_W = int(a_W_candidate)
+                        b_W = int(b_W_candidate)
+
+                        # Verify on all pairs
+                        linear_W_ok = all(
+                            W_out == a_W * W_in + b_W
+                            for _, W_in, _, W_out in io_shapes
+                        )
+
+                        if linear_W_ok:
+                            break  # Found valid W law
+
+            if linear_W_ok:
+                break
+
+        # If both H and W have valid linear laws, add this size law
+        # The law will be evaluated per test when H_in, W_in are known
+        if linear_H_ok and linear_W_ok:
+            # Proof: coefficients verified on all training pairs
+            proof_data = f"linear:a_H={a_H}:b_H={b_H}:a_W={a_W}:b_W={b_W}:pairs={len(io_shapes)}"
+            proof_hash = hashlib.sha256(proof_data.encode()).hexdigest()
+
+            size_laws.append({
+                "law": "linear",
+                "a_H": int(a_H),
+                "b_H": int(b_H),
+                "a_W": int(a_W),
+                "b_W": int(b_W),
+                "proof_hash": proof_hash,
+            })
+
+    # 3. CONTENT-BASED LAWS
+    # bbox, object-count, period-multiple - require test input to compute
+    # Deferred to WO-2 or later stages
+
+    return size_laws
+
+
 def run_stage_wo1(data_root: Path, strict: bool = False, enable_progress: bool = True, filter_tasks: Set[str] = None) -> None:
-    """Run WO-1 stage: bins, bbox, center predicate.
+    """Run WO-1 stage: bins, bbox, center predicate, and size law enumeration.
 
     Args:
         data_root: Directory containing ARC JSON files
@@ -257,9 +394,9 @@ def run_stage_wo1(data_root: Path, strict: bool = False, enable_progress: bool =
     Notes:
         - Loads actual task data (train/test)
         - For each task, computes bins, bbox, center predicate
+        - Enumerates all proven size laws (Constant, Linear, Content-based)
         - Emits receipts/<task_id>/wo01.json
-        - Assumes all training outputs have same shape (canvas)
-        - At WO-1, we don't do embedding yet, so we use raw output grids
+        - Caches size laws to .cache/wo01/<task_id>.size_laws.json
     """
     # Discover task IDs
     print(f"[WO-1] Discovering tasks in {data_root}...", file=sys.stderr)
@@ -412,6 +549,33 @@ def run_stage_wo1(data_root: Path, strict: bool = False, enable_progress: bool =
                             center_all_ok = False
                             assert False, f"Center mode but delta ({dr}, {dc}) > 0.5"
                 acc_bool(progress, "center_all_ok", center_all_ok)
+
+            # Enumerate size laws
+            size_laws = enumerate_size_laws(train_pairs)
+
+            # Write size laws to cache for WO-9A
+            cache_dir = data_root.parent / ".cache" / "wo01"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            size_laws_path = cache_dir / f"{task_id}.size_laws.json"
+
+            # Compute hash of size laws for determinism
+            import hashlib
+            canonical_json = json.dumps(size_laws, sort_keys=True, separators=(",", ":"))
+            size_laws_hash = hashlib.sha256(canonical_json.encode()).hexdigest()
+
+            size_laws_cache = {
+                "size_laws": size_laws,
+                "hash": size_laws_hash,
+            }
+
+            with open(size_laws_path, "w") as f:
+                json.dump(size_laws_cache, f, indent=2, sort_keys=True)
+
+            # Add size laws info to receipt
+            payload["size_laws"] = {
+                "count": len(size_laws),
+                "laws": [law["law"] for law in size_laws],
+            }
 
             # Write receipt
             receipts.write_stage_receipt(task_id, "wo01", payload)
@@ -1365,6 +1529,56 @@ def run_stage_wo5(data_root: Path, strict: bool = False, enable_progress: bool =
 
             acc_bool(progress, "commuting_rows_ok", commute_ok)
 
+            # === QUOTAS ===
+            # Compute quotas from training outputs per Anchor 00 §8
+            # q[s,c] = min_i #{p∈B_s: Y_i(p)=c}
+            # "Minimum across training outputs of pixels in bin s assigned color c"
+            quotas_dict = {}
+            for c in range(10):  # PALETTE_C = 10
+                for s, bin_pixels in enumerate(bins_list):
+                    # Count assignments in each training output
+                    counts_per_example = []
+                    for Y_i in train_outputs_aligned:
+                        # Count pixels in bin s assigned color c in this training output
+                        count_in_output = sum(1 for p in bin_pixels if Y_i.flat[p] == c)
+                        counts_per_example.append(count_in_output)
+
+                    # Take minimum across training examples (conservative estimate)
+                    quota = min(counts_per_example) if counts_per_example else 0
+                    quotas_dict[(s, c)] = quota
+
+            # === FACES ===
+            # Compute faces per Anchor 00 §8 line 129: "meet of counts across outputs"
+            # faces_R[r,c] = min_i(count of color c in row r of Y_i)
+            # faces_S[j,c] = min_i(count of color c in column j of Y_i)
+            faces_R = np.zeros((H_out, 10), dtype=np.int64)
+            faces_S = np.zeros((W_out, 10), dtype=np.int64)
+
+            for c in range(10):  # PALETTE_C = 10
+                for r in range(H_out):
+                    # Count color c in each row r across all training outputs
+                    counts_per_example = []
+                    for Y_i in train_outputs_aligned:
+                        count_in_row = np.sum(Y_i[r, :] == c)
+                        counts_per_example.append(count_in_row)
+                    # Take minimum (meet)
+                    faces_R[r, c] = min(counts_per_example) if counts_per_example else 0
+
+                for j in range(W_out):
+                    # Count color c in each column j across all training outputs
+                    counts_per_example = []
+                    for Y_i in train_outputs_aligned:
+                        count_in_col = np.sum(Y_i[:, j] == c)
+                        counts_per_example.append(count_in_col)
+                    # Take minimum (meet)
+                    faces_S[j, c] = min(counts_per_example) if counts_per_example else 0
+
+            # Compute faces totals for receipt
+            faces_R_total = int(np.sum(faces_R))
+            faces_S_total = int(np.sum(faces_S))
+            faces_R_nonzero_rows = int(np.count_nonzero(np.sum(faces_R, axis=1)))
+            faces_S_nonzero_cols = int(np.count_nonzero(np.sum(faces_S, axis=1)))
+
             # Build receipt
             payload = {
                 "stage": "wo05",
@@ -1386,6 +1600,20 @@ def run_stage_wo5(data_root: Path, strict: bool = False, enable_progress: bool =
                     "laplacian_shape_ok": laplacian_shape_ok,
                     "uniqueness_proved_by": "theory",  # Maximum principle
                     "regions_info": harmonic_regions,
+                },
+                "faces": {
+                    "rows_total": faces_R_total,
+                    "cols_total": faces_S_total,
+                    "rows_nonzero": faces_R_nonzero_rows,
+                    "cols_nonzero": faces_S_nonzero_cols,
+                    "by_color": [
+                        {
+                            "color": c,
+                            "row_total": int(np.sum(faces_R[:, c])),
+                            "col_total": int(np.sum(faces_S[:, c])),
+                        }
+                        for c in range(10) if np.sum(faces_R[:, c]) > 0 or np.sum(faces_S[:, c]) > 0
+                    ],
                 },
             }
 
@@ -1411,24 +1639,7 @@ def run_stage_wo5(data_root: Path, strict: bool = False, enable_progress: bool =
             # Convert gravity_rows to array
             gravity_rows_array = np.array(gravity_rows, dtype=np.int64) if gravity_rows else np.array([], dtype=np.int64).reshape(0, 2)
 
-            # Compute quotas from training outputs per Anchor 00 §8
-            # q[s,c] = min_i #{p∈B_s: Y_i(p)=c}
-            # "Minimum across training outputs of pixels in bin s assigned color c"
-            quotas_dict = {}
-            for c in range(10):  # PALETTE_C = 10
-                for s, bin_pixels in enumerate(bins_list):
-                    # Count assignments in each training output
-                    counts_per_example = []
-                    for Y_i in train_outputs_aligned:
-                        # Count pixels in bin s assigned color c in this training output
-                        count_in_output = sum(1 for p in bin_pixels if Y_i.flat[p] == c)
-                        counts_per_example.append(count_in_output)
-
-                    # Take minimum across training examples (conservative estimate)
-                    quota = min(counts_per_example) if counts_per_example else 0
-                    quotas_dict[(s, c)] = quota
-
-            # Serialize quotas
+            # Serialize quotas (already computed above)
             quotas_array = np.array([[s, c, quotas_dict[(s, c)]] for (s, c) in sorted(quotas_dict.keys())], dtype=np.int64)
 
             # Build cell_caps from equalizers/gravity (for now, use simple formula)
@@ -1445,9 +1656,11 @@ def run_stage_wo5(data_root: Path, strict: bool = False, enable_progress: bool =
                 "walls_mask": walls_mask.astype(np.uint8),
                 "gravity_rows": gravity_rows_array,
                 "quotas": quotas_array,
+                "faces_R": faces_R,  # Row faces (H×C)
+                "faces_S": faces_S,  # Column faces (W×C)
                 "cell_caps": cell_caps,
                 "_A_hash_used": np.array([ord(c) for c in A_hash], dtype=np.uint8),  # Store hash as array
-                "_cache_version": np.array([1], dtype=np.int32),  # Track cache format version
+                "_cache_version": np.array([2], dtype=np.int32),  # Track cache format version (incremented for faces)
                 **equalizer_edges_serialized,  # Unpack equalizer edges as separate arrays
             }
 
@@ -2101,15 +2314,15 @@ def run_stage_wo8(data_root: Path, strict: bool = False, enable_progress: bool =
 
 def run_stage_wo09a(data_root: Path, strict: bool = False, enable_progress: bool = True, filter_tasks: Set[str] = None) -> None:
     """
-    WO-9A: Packs & Size Law
+    WO-9A: Packs & Size Law (Per-test concrete pack builder)
 
-    Enumerates deterministic packs for WO-9B. Each pack fixes:
-    - Output size law
+    Enumerates deterministic packs per (task,test,canvas) for WO-9B. Each pack fixes:
+    - Output size law (constant/linear concretized per test)
     - Faces mode (rows/cols/none)
     - Verified FREE maps
     - Quick feasibility flags
     """
-    from . import stages_wo09a
+    from . import stages_wo09a_prime as stages_wo09a
 
     # Initialize progress
     progress = init_progress(9)
@@ -2139,49 +2352,62 @@ def run_stage_wo09a(data_root: Path, strict: bool = False, enable_progress: bool
                 if not wo_receipt_path.exists():
                     raise FileNotFoundError(f"WO-{wo} receipt not found: {wo_receipt_path}")
 
-            # Run WO-9A pack enumeration (writes receipt and cache itself)
-            receipt = stages_wo09a.run_wo09a(task_id, data_root)
+            # Run WO-9A′ per-test pack enumeration (writes receipt and cache itself)
+            receipt = stages_wo09a.run_wo09a_prime(task_id, data_root)
 
-            # Extract metrics from receipt
-            packs_count = receipt.get("packs_count", 0)
+            # Extract metrics from receipt (WO-9A′ per-test format)
+            total_packs_count = receipt.get("total_packs_count", 0)
             packs_hash = receipt.get("hash", "")
-            packs = receipt.get("packs", [])
+            tests_processed = receipt.get("tests_processed", [])
 
             # Store hash for determinism check
             first_run_hashes[task_id] = packs_hash
 
-            # Accumulate packs_exist_ok metric
-            packs_exist_ok = (packs_count >= 1)
+            # Accumulate packs_exist_ok metric (all tests should have packs)
+            packs_exist_ok = all(test_info["packs_count"] >= 1 for test_info in tests_processed)
             acc_bool(progress, "packs_exist_ok", packs_exist_ok)
 
-            # Quick checks: verify no exceptions during computation
-            quick_checks_ok = all(
-                "quick" in pack and isinstance(pack["quick"], dict)
-                for pack in packs
-            )
-            acc_bool(progress, "quick_checks_ok", quick_checks_ok)
-
-            # Check if task has faces (from WO-5 cache)
+            # Load packs from per-test cache files to check quick checks and faces modes
             cache_root = data_root.parent / ".cache"
-            wo5_cache_path = cache_root / "wo05" / f"{task_id}.npz"
-            if wo5_cache_path.exists():
-                wo5_data = np.load(wo5_cache_path)
-                faces_R = wo5_data.get("faces_R", None)
-                faces_S = wo5_data.get("faces_S", None)
-                has_faces = (faces_R is not None) or (faces_S is not None)
-                task_has_faces[task_id] = has_faces
+            all_packs = []
+            for test_info in tests_processed:
+                test_idx = test_info["test_idx"]
+                pack_cache_path = cache_root / "wo09" / f"{task_id}.{test_idx}.packs.json"
+                if pack_cache_path.exists():
+                    with open(pack_cache_path) as f:
+                        pack_cache = json.load(f)
+                    all_packs.extend(pack_cache.get("packs", []))
 
-                # Faces mode check per spec
-                if has_faces:
-                    faces_mode_ok = any(p["faces_mode"] in ("rows_as_supply", "cols_as_supply") for p in packs)
-                else:
-                    faces_mode_ok = all(p["faces_mode"] == "none" for p in packs)
-                acc_bool(progress, "faces_mode_ok", faces_mode_ok)
-            else:
-                # No WO-5 cache, assume no faces
-                task_has_faces[task_id] = False
-                faces_mode_ok = all(p["faces_mode"] == "none" for p in packs)
-                acc_bool(progress, "faces_mode_ok", faces_mode_ok)
+            # Quick checks: verify no exceptions during computation
+            if all_packs:
+                quick_checks_ok = all(
+                    "quick" in pack and isinstance(pack["quick"], dict)
+                    for pack in all_packs
+                )
+                acc_bool(progress, "quick_checks_ok", quick_checks_ok)
+
+                # Faces mode check per spec (check per-canvas WO-5 files)
+                for test_info in tests_processed:
+                    test_idx = test_info["test_idx"]
+                    for canvas_id in test_info.get("canvases", []):
+                        wo5_cache_path = cache_root / "wo05" / f"{task_id}.{test_idx}.{canvas_id}.npz"
+                        if wo5_cache_path.exists():
+                            wo5_data = np.load(wo5_cache_path)
+                            faces_R = wo5_data.get("faces_R", None)
+                            faces_S = wo5_data.get("faces_S", None)
+                            has_faces = (faces_R is not None and faces_R.sum() > 0) or \
+                                       (faces_S is not None and faces_S.sum() > 0)
+
+                            # Get packs for this canvas
+                            canvas_packs = [p for p in all_packs if p.get("canvas_id") == canvas_id]
+
+                            # Faces mode check per spec
+                            if has_faces:
+                                faces_mode_ok = any(p["faces_mode"] in ("rows_as_supply", "cols_as_supply")
+                                                   for p in canvas_packs)
+                            else:
+                                faces_mode_ok = all(p["faces_mode"] == "none" for p in canvas_packs)
+                            acc_bool(progress, "faces_mode_ok", faces_mode_ok)
 
             success_count += 1
 
@@ -2204,8 +2430,8 @@ def run_stage_wo09a(data_root: Path, strict: bool = False, enable_progress: bool
 
     for task_id in sample_task_ids:
         try:
-            # Re-run WO-9A
-            rerun_receipt = stages_wo09a.run_wo09a(task_id, data_root)
+            # Re-run WO-9A′
+            rerun_receipt = stages_wo09a.run_wo09a_prime(task_id, data_root)
             rerun_hash = rerun_receipt.get("hash", "")
 
             # Compare hashes

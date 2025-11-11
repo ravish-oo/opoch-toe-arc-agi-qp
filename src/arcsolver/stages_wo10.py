@@ -262,7 +262,7 @@ def process_single_test(
     Returns:
         Dict with status, match (if evaluate), and receipt path
     """
-    # Load WO-9B receipt for this test
+    # Load WO-9B receipt for this test (constant law packs)
     wo9b_receipt_path = task_receipt_dir / "wo09b.json"
     if not wo9b_receipt_path.exists():
         raise FileNotFoundError(f"WO-9B receipt not found: {wo9b_receipt_path}")
@@ -273,24 +273,93 @@ def process_single_test(
     packs_tried = wo9b_receipt["packs_tried"]
     iis = wo9b_receipt.get("iis")
 
+    # Evaluate linear laws per test input (Fix 1: linear law support)
+    # Load WO-1 size laws to check for linear laws
+    wo1_cache_path = cache_root / "wo01" / f"{task_id}.size_laws.json"
+    if wo1_cache_path.exists():
+        with open(wo1_cache_path) as f:
+            wo1_cache = json.load(f)
+
+        # Check if any linear laws exist
+        linear_laws = [sl for sl in wo1_cache["size_laws"] if sl.get("law") == "linear"]
+
+        if len(linear_laws) > 0:
+            # Get test input shape
+            test_input = np.array(test_pair["input"], dtype=np.int32)
+            H_in, W_in = test_input.shape
+
+            # For each linear law, compute concrete (H,W) for this test
+            # NOTE: Full implementation would solve flows for these packs
+            # For now, mark as "linear_law_deferred" in packs_tried
+            for linear_law in linear_laws:
+                a_H = linear_law["a_H"]
+                b_H = linear_law["b_H"]
+                a_W = linear_law["a_W"]
+                b_W = linear_law["b_W"]
+
+                H_out = a_H * H_in + b_H
+                W_out = a_W * W_in + b_W
+
+                # Add placeholder pack to packs_tried
+                # Full implementation: solve flow for this (H,W) canvas
+                packs_tried.append({
+                    "pack_id": f"size={H_out}x{W_out}|faces=none|free=[]|linear",
+                    "drops": [],
+                    "result": {
+                        "status": "DEFERRED",
+                        "note": f"Linear law (H={a_H}*{H_in}+{b_H}={H_out}, W={a_W}*{W_in}+{b_W}={W_out}) detected but not yet solved",
+                    },
+                })
+
     # Select best pack using lex-min comparator (WO-10 responsibility)
     best_pack = select_best_pack_lexmin(packs_tried, task_id, cache_root)
 
     # Determine status
     if best_pack is not None:
-        # Feasible - load selected pack's solution and decode
-        selected_pack_id = best_pack["pack_id"]
-        delta_bits = best_pack["delta_bits"]
+        # Check pack viability (Proposal A: reject zero-supply packs)
+        # Load WO-7 receipt to get supplies_total
+        wo7_receipt_path = task_receipt_dir / "wo07.json"
+        with open(wo7_receipt_path) as f:
+            wo7_receipt = json.load(f)
+        supplies_total = wo7_receipt["graph"]["supplies"]["total"]
 
-        result = process_feasible_test(
-            task_id,
-            test_id,
-            selected_pack_id,
-            delta_bits,
-            data_root,
-            cache_root,
-        )
-        status = "OPTIMAL"
+        # Load A_mask from WO-4 cache
+        wo4_cache_path = cache_root / "wo04" / f"{task_id}.npz"
+        wo4_cache = np.load(wo4_cache_path)
+        allowed_any = bool(wo4_cache["A_mask"].any())
+
+        # Pack viability check: zero-supply pack cannot express any paid work
+        zero_supply_pack = (supplies_total == 0 and allowed_any)
+
+        if zero_supply_pack:
+            # Reject degenerate pack → UNSAT per §11/§16
+            selected_pack_id = best_pack["pack_id"]
+            result = {
+                "status": "UNSAT",
+                "pack_viability": {
+                    "supplies_total": supplies_total,
+                    "allowed_any": allowed_any,
+                    "zero_supply_pack": True,
+                    "decision": "UNSAT",
+                    "reason": "R0_zero_supply_pack",
+                },
+                "iis": None,
+            }
+            status = "UNSAT"
+        else:
+            # Feasible - load selected pack's solution and decode
+            selected_pack_id = best_pack["pack_id"]
+            delta_bits = best_pack["delta_bits"]
+
+            result = process_feasible_test(
+                task_id,
+                test_id,
+                selected_pack_id,
+                delta_bits,
+                data_root,
+                cache_root,
+            )
+            status = "OPTIMAL"
     else:
         # Infeasible - use IIS from WO-9B
         selected_pack_id = None
@@ -436,7 +505,13 @@ def build_wo10_receipt(
             "kkt_ok": True,  # OR-Tools OPTIMAL status guarantees KKT conditions
         }
         receipt["iis"] = {"present": False}
+    elif status == "UNSAT":
+        # Pack viability rejection (e.g., zero-supply pack)
+        receipt["final"] = {"status": "UNSAT"}
+        receipt["pack_viability"] = result["pack_viability"]
+        receipt["iis"] = {"present": False}
     else:
+        # INFEASIBLE
         receipt["final"] = {"status": "INFEASIBLE"}
         receipt["iis"] = result["iis"]
 
