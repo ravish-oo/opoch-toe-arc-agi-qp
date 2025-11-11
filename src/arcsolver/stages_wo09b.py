@@ -20,6 +20,80 @@ import numpy as np
 from . import flows
 from . import packs as packs_module
 from . import relax
+from .stages_wo10 import make_pack_id_safe
+
+
+def cache_pack_solution(
+    task_id: str,
+    data_root: Path,
+    result: relax.PackResult,
+    pack_id: str,
+    H: int,
+    W: int,
+    C: int,
+    A_mask: np.ndarray,
+) -> None:
+    """
+    Cache a feasible pack's solution for WO-10 lex-min selection.
+
+    Saves .cache/wo07/<task_id>.<pack_id_safe>.npz with:
+    - bin_to_pixel arc flows (for building x_pc)
+    - Canvas dimensions (H, W, C)
+    - Pack ID
+    - Hashes for determinism (costs, A_mask)
+    - WO-7 proof flags and optimal_cost
+    """
+    cache_root = data_root.parent / ".cache"
+
+    # Extract bin_to_pixel arcs from solution
+    arcs_p = []
+    arcs_c = []
+    arcs_flow = []
+
+    for flow_data in result.solution["flows"]:
+        if flow_data.get("type") == "bin_to_pixel":
+            arcs_p.append(flow_data["p"])
+            arcs_c.append(flow_data["c"])
+            arcs_flow.append(flow_data["flow"])
+
+    arcs_p = np.array(arcs_p, dtype=np.int32)
+    arcs_c = np.array(arcs_c, dtype=np.uint8)
+    arcs_flow = np.array(arcs_flow, dtype=np.uint8)
+
+    # Compute hashes for determinism checks
+    A_hash = hashlib.sha256(A_mask.tobytes(order='C')).hexdigest()
+
+    # Load WO-6 costs for hash
+    wo6_cache = np.load(cache_root / "wo06" / f"{task_id}.npz")
+    costs = wo6_cache["costs"]
+    costs_hash = hashlib.sha256(costs.tobytes(order='C')).hexdigest()
+
+    # Save to cache with pack_id in filename (safe encoding)
+    cache_dir = cache_root / "wo07"
+    cache_dir.mkdir(exist_ok=True, parents=True)
+
+    # Make pack_id filesystem-safe (handles long pack IDs via hashing)
+    pack_id_safe = make_pack_id_safe(pack_id)
+    cache_path = cache_dir / f"{task_id}.pack_{pack_id_safe}.npz"
+
+    np.savez(
+        cache_path,
+        arcs_p=arcs_p,
+        arcs_c=arcs_c,
+        arcs_flow=arcs_flow,
+        H=H,
+        W=W,
+        C=C,
+        pack_id=pack_id,
+        costs_hash=costs_hash,
+        A_hash=A_hash,
+        # WO-7 proof flags
+        optimal_cost=result.optimal_cost,
+        primal_balance_ok=result.primal_balance_ok,
+        capacity_ok=result.capacity_ok,
+        cost_equal_ok=result.cost_equal_ok,
+        one_of_10_ok=result.one_of_10_ok,
+    )
 
 
 def run_wo09b(task_id: str, data_root: Path) -> Dict:
@@ -100,8 +174,8 @@ def run_wo09b(task_id: str, data_root: Path) -> Dict:
 
     # === TRY PACKS IN LEX ORDER ===
     packs_tried = []
-    selected_pack_id = None
     iis = None
+    any_feasible = False
 
     for pack in packs:
         pack_trial = {
@@ -126,18 +200,31 @@ def run_wo09b(task_id: str, data_root: Path) -> Dict:
             result.cell_caps_ok,
             result.cost_equal_ok,
         ]):
-            # Success! Select this pack
+            # Feasible! Cache for WO-10 lex-min selection
             pack_trial["result"] = {
                 "status": result.status,
                 "primal_balance_ok": result.primal_balance_ok,
                 "capacity_ok": result.capacity_ok,
                 "cost_equal_ok": result.cost_equal_ok,
                 "one_of_10_ok": result.one_of_10_ok,
-                "selected": True,
+                "optimal_cost": result.optimal_cost,
             }
             packs_tried.append(pack_trial)
-            selected_pack_id = current_pack.pack_id
-            break
+            any_feasible = True
+
+            # Cache this pack's solution for WO-10
+            cache_pack_solution(
+                task_id,
+                data_root,
+                result,
+                current_pack.pack_id,
+                base_inputs["H"],
+                base_inputs["W"],
+                base_inputs["C"],
+                A_mask,
+            )
+            # Continue to try remaining packs (WO-10 needs all feasible packs for lex-min)
+            continue
 
         # Step 2a: Drop faces if failure is faces tier
         if result.failure_tier == "faces" and current_pack.faces_mode != "none":
@@ -158,18 +245,31 @@ def run_wo09b(task_id: str, data_root: Path) -> Dict:
                 result.cell_caps_ok,
                 result.cost_equal_ok,
             ]):
-                # Success after dropping faces
+                # Feasible after dropping faces
                 pack_trial["result"] = {
                     "status": result.status,
                     "primal_balance_ok": result.primal_balance_ok,
                     "capacity_ok": result.capacity_ok,
                     "cost_equal_ok": result.cost_equal_ok,
                     "one_of_10_ok": result.one_of_10_ok,
-                    "selected": True,
+                    "optimal_cost": result.optimal_cost,
                 }
                 packs_tried.append(pack_trial)
-                selected_pack_id = current_pack.pack_id
-                break
+                any_feasible = True
+
+                # Cache this pack's solution for WO-10
+                cache_pack_solution(
+                    task_id,
+                    data_root,
+                    result,
+                    current_pack.pack_id,
+                    base_inputs["H"],
+                    base_inputs["W"],
+                    base_inputs["C"],
+                    A_mask,
+                )
+                # Continue to try remaining packs
+                continue
 
         # Step 2b: Reduce quotas if failure is quota tier
         # (Uses current_pack, which may have faces already dropped)
@@ -198,18 +298,31 @@ def run_wo09b(task_id: str, data_root: Path) -> Dict:
                     result.cell_caps_ok,
                     result.cost_equal_ok,
                 ]):
-                    # Success after quota reduction
+                    # Feasible after quota reduction
                     pack_trial["result"] = {
                         "status": result.status,
                         "primal_balance_ok": result.primal_balance_ok,
                         "capacity_ok": result.capacity_ok,
                         "cost_equal_ok": result.cost_equal_ok,
                         "one_of_10_ok": result.one_of_10_ok,
-                        "selected": True,
+                        "optimal_cost": result.optimal_cost,
                     }
                     packs_tried.append(pack_trial)
-                    selected_pack_id = current_pack.pack_id
-                    break
+                    any_feasible = True
+
+                    # Cache this pack's solution for WO-10
+                    cache_pack_solution(
+                        task_id,
+                        data_root,
+                        result,
+                        current_pack.pack_id,
+                        base_inputs["H"],
+                        base_inputs["W"],
+                        base_inputs["C"],
+                        A_mask,
+                    )
+                    # Continue to try remaining packs
+                    continue
 
         # Step 3: If still infeasible and hard tier, build IIS
         if result.failure_tier == "hard":
@@ -248,10 +361,11 @@ def run_wo09b(task_id: str, data_root: Path) -> Dict:
         packs_tried.append(pack_trial)
 
     # === BUILD RECEIPT ===
+    # Note: No selected_pack_id here - WO-10 will do lex-min selection
     receipt = {
         "stage": "wo09b",
         "packs_tried": packs_tried,
-        "selected_pack_id": selected_pack_id,
+        "any_feasible": any_feasible,
         "iis": iis,
     }
 

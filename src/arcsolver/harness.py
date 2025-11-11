@@ -47,6 +47,7 @@ WO_METRICS = {
     8: ["decode_one_of_10_ok", "decode_mask_ok", "bit_meter_check_ok", "idempotence_ok", "bits_sum"],
     9: ["packs_exist_ok", "packs_deterministic_ok", "quick_checks_ok", "faces_mode_ok"],
     10: ["pack_choose_ok", "laminar_respects_tiers_ok", "determinism_ok", "iis_present_ok"],
+    11: ["receipt_determinism_ok", "final_feasible_ok", "final_iis_ok", "eval_ok"],
 }
 
 
@@ -2416,6 +2417,181 @@ def run_stage_wo09b(data_root: Path, strict: bool = False, enable_progress: bool
         sys.exit(1)
 
 
+def run_stage_wo10(data_root: Path, strict: bool = False, enable_progress: bool = True, filter_tasks: Set[str] = None, evaluate: bool = False) -> None:
+    """
+    WO-10: End-to-end Φ + receipts
+
+    Orchestrates full pipeline for each test input:
+    1. Load WO-9B results and select final pack
+    2. If feasible → decode to Ŷ using WO-8 decode
+    3. If infeasible → use IIS from WO-9B
+    4. Write final receipts and optionally evaluate against ground truth
+    """
+    from . import stages_wo10
+
+    # Initialize progress
+    progress = init_progress(11)
+
+    # Discover tasks
+    task_ids = discover_task_ids(data_root)
+    # Apply filter if provided
+    if filter_tasks:
+        task_ids = task_ids & filter_tasks
+    print(f"[WO-10] Found {len(task_ids)} tasks", file=sys.stderr)
+
+    success_count = 0
+    fail_count = 0
+
+    # Track first run hashes for determinism check
+    first_run_hashes = {}
+
+    for task_id in sorted(task_ids):
+        try:
+            # Check that required prior WOs exist
+            receipts_dir = Path("receipts")
+            task_dir = receipts_dir / task_id
+            required_wos = [0, 1, 2, 3, 4, 5, 6, 7, 9, 10]  # Need WO-9A and WO-9B
+            for wo in required_wos:
+                if wo < 9:
+                    wo_receipt_path = task_dir / f"wo{wo:02d}.json"
+                elif wo == 9:
+                    wo_receipt_path = task_dir / "wo09a.json"
+                else:  # wo == 10
+                    wo_receipt_path = task_dir / "wo09b.json"
+
+                if not wo_receipt_path.exists():
+                    raise FileNotFoundError(f"WO-{wo} receipt not found: {wo_receipt_path}")
+
+            # Run WO-10 end-to-end pipeline
+            result = stages_wo10.run_wo10(task_id, data_root, evaluate=evaluate)
+
+            # Load wo10 receipts for metrics (may be multiple test inputs)
+            test_count = result.get("test_count", 0)
+            feasible_count = result.get("feasible_count", 0)
+            infeasible_count = result.get("infeasible_count", 0)
+
+            # Check first test's receipt for determinism
+            wo10_test0_path = task_dir / "wo10_test0.json"
+            if wo10_test0_path.exists():
+                with open(wo10_test0_path) as f:
+                    wo10_receipt = json.load(f)
+                receipt_hash = wo10_receipt.get("hash", "")
+                first_run_hashes[task_id] = receipt_hash
+
+            # Metrics
+            # final_feasible_ok: for feasible tests, all WO-7 proof flags must be true
+            final_feasible_ok = True
+            if feasible_count > 0:
+                for test_id in range(test_count):
+                    wo10_test_path = task_dir / f"wo10_test{test_id}.json"
+                    if wo10_test_path.exists():
+                        with open(wo10_test_path) as f:
+                            wo10_test = json.load(f)
+                        final = wo10_test.get("final", {})
+                        if final.get("status") == "OPTIMAL":
+                            checks = [
+                                final.get("primal_balance_ok", False),
+                                final.get("capacity_ok", False),
+                                final.get("cost_equal_ok", False),
+                                final.get("one_of_10_decode_ok", False),
+                                final.get("decode_mask_ok", False),
+                                final.get("idempotence_ok", False),
+                            ]
+                            if not all(checks):
+                                final_feasible_ok = False
+                                break
+
+            acc_bool(progress, "final_feasible_ok", final_feasible_ok)
+
+            # final_iis_ok: for infeasible tests, IIS must be present
+            final_iis_ok = True
+            if infeasible_count > 0:
+                for test_id in range(test_count):
+                    wo10_test_path = task_dir / f"wo10_test{test_id}.json"
+                    if wo10_test_path.exists():
+                        with open(wo10_test_path) as f:
+                            wo10_test = json.load(f)
+                        if wo10_test.get("final", {}).get("status") == "INFEASIBLE":
+                            iis = wo10_test.get("iis", {})
+                            if not iis.get("present", False):
+                                final_iis_ok = False
+                                break
+
+            acc_bool(progress, "final_iis_ok", final_iis_ok)
+
+            # eval_ok: if evaluate mode, check eval.json exists and is well-formed
+            eval_ok = True
+            if evaluate:
+                eval_path = task_dir / "eval.json"
+                if eval_path.exists():
+                    with open(eval_path) as f:
+                        eval_data = json.load(f)
+                    # Sanity: counts should match
+                    eval_summary = eval_data.get("summary", {})
+                    if eval_summary.get("total", 0) != test_count:
+                        eval_ok = False
+                else:
+                    eval_ok = False
+
+            acc_bool(progress, "eval_ok", eval_ok if evaluate else True)
+
+            success_count += 1
+
+        except Exception as e:
+            print(f"[WO-10] Task {task_id} failed: {e}", file=sys.stderr)
+            if strict:
+                raise
+            fail_count += 1
+
+    # Determinism check: re-run sample tasks and compare hashes (WO-10 spec: 3-5 tasks)
+    print("[WO-10] Running determinism check on sample tasks...", file=sys.stderr)
+    deterministic_ok = True
+    sample_tasks = list(sorted(first_run_hashes.keys()))[:min(5, len(first_run_hashes))]
+    for task_id in sample_tasks:
+        try:
+            # Re-run
+            stages_wo10.run_wo10(task_id, data_root, evaluate=evaluate)
+
+            # Load hash from wo10_test0
+            receipts_dir = Path("receipts")
+            task_dir = receipts_dir / task_id
+            wo10_test0_path = task_dir / "wo10_test0.json"
+            if wo10_test0_path.exists():
+                with open(wo10_test0_path) as f:
+                    wo10_receipt = json.load(f)
+                second_hash = wo10_receipt.get("hash", "")
+
+                if first_run_hashes.get(task_id) != second_hash:
+                    deterministic_ok = False
+                    print(f"[WO-10] Determinism check FAILED for task {task_id}", file=sys.stderr)
+                    break
+        except Exception as e:
+            print(f"[WO-10] Determinism check failed for {task_id}: {e}", file=sys.stderr)
+            deterministic_ok = False
+            break
+
+    if deterministic_ok:
+        print("[WO-10] ✓ Determinism verified: all sample tasks produced identical hashes", file=sys.stderr)
+
+    # Accumulate determinism metric for ALL tasks
+    for _ in range(success_count):
+        acc_bool(progress, "receipt_determinism_ok", deterministic_ok)
+
+    # Summary
+    print(
+        f"[WO-10] Complete: {success_count} receipts written, {fail_count} failures",
+        file=sys.stderr,
+    )
+
+    # Write progress
+    if enable_progress:
+        receipts.write_run_progress(progress)
+        print(f"[WO-10] Progress written to progress/progress_wo11.json", file=sys.stderr)
+
+    if fail_count > 0 and strict:
+        sys.exit(1)
+
+
 def main() -> None:
     """CLI entry point for harness."""
     parser = argparse.ArgumentParser(
@@ -2465,6 +2641,11 @@ Examples:
         default=None,
         help="Comma-separated list of task IDs to process (e.g., '00576224,007bbfb7')",
     )
+    parser.add_argument(
+        "--evaluate",
+        action="store_true",
+        help="Enable evaluation mode: compare predictions to ground truth (WO-10 only)",
+    )
 
     args = parser.parse_args()
 
@@ -2492,6 +2673,7 @@ Examples:
         8: run_stage_wo8,
         9: run_stage_wo09a,
         10: run_stage_wo09b,
+        11: run_stage_wo10,
     }
 
     # Run stages
@@ -2502,7 +2684,11 @@ Examples:
 
     for wo in range(args.upto_wo + 1):
         if wo in STAGE_RUNNERS:
-            STAGE_RUNNERS[wo](args.data_root, strict=args.strict, enable_progress=args.progress, filter_tasks=filter_tasks)
+            # WO-10 (stage 11) needs evaluate flag
+            if wo == 11:
+                STAGE_RUNNERS[wo](args.data_root, strict=args.strict, enable_progress=args.progress, filter_tasks=filter_tasks, evaluate=args.evaluate)
+            else:
+                STAGE_RUNNERS[wo](args.data_root, strict=args.strict, enable_progress=args.progress, filter_tasks=filter_tasks)
         else:
             print(
                 f"[harness] WO-{wo} not implemented yet (available: {sorted(STAGE_RUNNERS.keys())})",
