@@ -17,6 +17,7 @@ def wo7_precheck(
     A_mask: np.ndarray,  # (N,C) bool
     quotas: np.ndarray,  # (S,C) int64, as per §8 (min over trainings)
     eq_rows: Dict[Tuple[int, int], np.ndarray] | None = None,
+    costs: np.ndarray | None = None,  # (N,C) int64, optional for diagnostic
 ) -> Dict:
     """
     Pre-check WO-7 feasibility without running the solver.
@@ -25,12 +26,17 @@ def wo7_precheck(
     1. Capacity: quota[s,c] <= |{p ∈ B_s : A[p,c]==1}| (§8)
     2. Constant-on-bin: For equalizers with |S|>=2, quota must be 0 or |S| (§3/§4/§10)
 
+    WO-B Fix C: Also computes diagnostic values:
+    3. supplies_total: sum of all quotas (§11/§16 zero-supply gate)
+    4. costs_nonzero_count: count of non-zero costs (degenerate objective check)
+
     Args:
         H, W: Grid dimensions
         bin_ids: Bin assignment for each pixel (N,)
         A_mask: Allowed colors per pixel (N, C)
         quotas: Minimum color counts per bin (S, C)
         eq_rows: Equalizer edges dict {(s,c): edges_array} from WO-05 cache
+        costs: Optional cost matrix for degenerate objective check
 
     Returns:
         {
@@ -38,12 +44,27 @@ def wo7_precheck(
             "capacity_ok": bool,
             "constant_bin_ok": bool,
             "capacity_conflicts": [{"bin":s,"color":c,"q":int,"allowed":int}...],
-            "eq_conflicts": [{"bin":s,"color":c,"q":int,"allowed":int,"eq_size":int}...]
+            "eq_conflicts": [{"bin":s,"color":c,"q":int,"allowed":int,"eq_size":int}...],
+            "supplies_total": int,  # WO-B diagnostic
+            "zero_supply_pack": bool,  # WO-B diagnostic
+            "costs_nonzero_count": int | None,  # WO-B diagnostic
+            "degenerate_objective": bool,  # WO-B diagnostic
         }
     """
     S = quotas.shape[0]
     C = quotas.shape[1]
     N = bin_ids.shape[0]
+
+    # WO-B Fix C: Compute diagnostic values
+    supplies_total = int(np.sum(quotas))
+    zero_supply_pack = (supplies_total == 0)
+
+    costs_nonzero_count = None
+    degenerate_objective = False
+    if costs is not None:
+        costs_nonzero_count = int(np.count_nonzero(costs))
+        # Degenerate if supplies > 0 but all costs are zero
+        degenerate_objective = (supplies_total > 0 and costs_nonzero_count == 0)
 
     # Count allowed[s,c] = |{p ∈ B_s : A[p,c]==1}|
     allowed = np.zeros_like(quotas, dtype=np.int64)
@@ -102,4 +123,9 @@ def wo7_precheck(
         "constant_bin_ok": constant_bin_ok,
         "capacity_conflicts": cap_conf,
         "eq_conflicts": eq_conf,
+        # WO-B Fix C diagnostics
+        "supplies_total": supplies_total,
+        "zero_supply_pack": zero_supply_pack,
+        "costs_nonzero_count": costs_nonzero_count,
+        "degenerate_objective": degenerate_objective,
     }

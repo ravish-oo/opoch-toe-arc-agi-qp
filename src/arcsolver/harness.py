@@ -1130,6 +1130,19 @@ def run_stage_wo4(data_root: Path, strict: bool = False, enable_progress: bool =
 
             # Get bins for canonical bin histograms (needed for alignment)
             bin_ids, bins_list = bins_module.build_bins(H_out, W_out)
+
+            # WO-B Fix: Renumber bin_ids to consecutive [0, 1, ..., num_bins-1]
+            # Same fix as in canvas_ops.py for per-canvas mode
+            unique_bin_ids = np.unique(bin_ids)
+            bin_id_map = {old_id: new_id for new_id, old_id in enumerate(unique_bin_ids)}
+            bin_ids = np.array([bin_id_map[bid] for bid in bin_ids], dtype=np.int32)
+
+            # Update bins_list to match renumbered IDs
+            bins_list_renumbered = [[] for _ in range(len(unique_bin_ids))]
+            for p in range(len(bin_ids)):
+                bins_list_renumbered[bin_ids[p]].append(p)
+            bins_list = bins_list_renumbered
+
             num_bins = len(bins_list)
 
             # Align colors (from WO-3)
@@ -1293,6 +1306,7 @@ def run_stage_wo4(data_root: Path, strict: bool = False, enable_progress: bool =
                 aligned_outputs=np.array(aligned_outputs, dtype=GRID_DTYPE),
                 F_mask=F_with_lift.astype(np.uint8),
                 A_mask=A.astype(np.uint8),
+                bin_ids=bin_ids,  # WO-B Fix: Save renumbered bin_ids for WO-5
             )
 
             # Save to cache for fast WO-7 iteration
@@ -1415,12 +1429,26 @@ def run_stage_wo5(data_root: Path, strict: bool = False, enable_progress: bool =
             F_mask = artifacts["F_mask"]
             A_mask = artifacts["A_mask"]
 
+            # WO-B Fix: Load bin_ids from WO-4 artifacts (must use same bins as WO-4)
+            # Per anchor §8, quotas are per-bin using WO-4's bin partition
+            if "bin_ids" in artifacts:
+                bin_ids = artifacts["bin_ids"]
+            else:
+                # Fallback for old caches without bin_ids (pre-fix)
+                bin_ids_old, _ = bins_module.build_bins(H_out, W_out)
+                # Apply renumbering for consistency
+                unique_bin_ids = np.unique(bin_ids_old)
+                bin_id_map = {old_id: new_id for new_id, old_id in enumerate(unique_bin_ids)}
+                bin_ids = np.array([bin_id_map[bid] for bid in bin_ids_old], dtype=np.int32)
+
+            # Reconstruct bins_list from bin_ids
+            num_bins = int(bin_ids.max()) + 1
+            bins_list = [[] for _ in range(num_bins)]
+            for p in range(len(bin_ids)):
+                bins_list[bin_ids[p]].append(p)
+
             # Convert aligned_outputs to list of grids
             train_outputs_aligned = [aligned_outputs[i] for i in range(aligned_outputs.shape[0])]
-
-            # Build bins (deterministic from H_out, W_out)
-            bin_ids, bins_list = bins_module.build_bins(H_out, W_out)
-            num_bins = len(bins_list)
 
             N = H_out * W_out
 
@@ -1719,8 +1747,8 @@ def run_stage_wo6(data_root: Path, strict: bool = False, enable_progress: bool =
 
     # Import required modules
     import hashlib
-    from arcsolver import scores as scores_module
-    from arcsolver import bins as bins_module
+    from . import scores as scores_module
+    from . import bins as bins_module
 
     # Initialize progress
     progress = init_progress(6)
@@ -2759,7 +2787,7 @@ def run_stage_wo10(data_root: Path, strict: bool = False, enable_progress: bool 
                         with open(wo10_test_path) as f:
                             wo10_test = json.load(f)
                         if wo10_test.get("final", {}).get("status") == "INFEASIBLE":
-                            iis = wo10_test.get("iis", {})
+                            iis = wo10_test.get("iis") or {}
                             if not iis.get("present", False):
                                 final_iis_ok = False
                                 break

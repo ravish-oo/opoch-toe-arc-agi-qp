@@ -125,31 +125,59 @@ def try_pack(
         pack_inputs["faces_R"] = None
         pack_inputs["faces_S"] = None
 
+    # WO-B Fix C: Early diagnostic check for zero supply and degenerate objective
+    # Convert quotas dict to array for precheck
+    quotas_dict = pack_inputs["quotas"]
+    S = len(pack_inputs["bins"])
+    C = pack_inputs["C"]
+    quotas_array = np.zeros((S, C), dtype=np.int64)
+    for (s, c), q in quotas_dict.items():
+        quotas_array[s, c] = q
+
+    from .precheck import wo7_precheck
+    precheck_diagnostic = wo7_precheck(
+        H=pack_inputs["H"],
+        W=pack_inputs["W"],
+        bin_ids=bin_ids,
+        A_mask=A_mask,
+        quotas=quotas_array,
+        eq_rows=pack_inputs.get("equalizer_edges", {}),
+        costs=pack_inputs["costs"],
+    )
+
+    # Short-circuit if zero supply (§11/§16 zero-supply gate)
+    if precheck_diagnostic["zero_supply_pack"]:
+        return PackResult(
+            status="INFEASIBLE",
+            primal_balance_ok=False,
+            capacity_ok=True,  # Not a capacity issue
+            mask_ok=True,  # Not a mask issue
+            one_of_10_ok=False,
+            cell_caps_ok=True,
+            cost_equal_ok=False,
+            optimal_cost=0,
+            failure_tier="quotas",  # Zero supply is a quota-tier issue
+            precheck=precheck_diagnostic,
+            solution=None,
+        )
+
+    # Log warning if degenerate objective (supplies > 0 but all costs zero)
+    if precheck_diagnostic["degenerate_objective"]:
+        import sys
+        print(
+            f"[WARNING] Degenerate objective: supplies_total={precheck_diagnostic['supplies_total']} "
+            f"but costs_nonzero_count={precheck_diagnostic['costs_nonzero_count']}. "
+            f"This likely indicates a WO-06 cost computation bug.",
+            file=sys.stderr,
+        )
+
     # Explicit faces precondition check BEFORE building graph (deterministic)
     if pack.faces_mode != "none":
         try:
             flows.check_input_preconditions(pack_inputs)
         except ValueError:
             # Faces precondition failed - return deterministically
-            from .precheck import wo7_precheck
-
-            # Convert quotas dict to array for precheck
-            quotas_dict = pack_inputs["quotas"]
-            S = len(pack_inputs["bins"])
-            C = pack_inputs["C"]
-            quotas_array = np.zeros((S, C), dtype=np.int64)
-            for (s, c), q in quotas_dict.items():
-                quotas_array[s, c] = q
-
-            precheck_result = wo7_precheck(
-                H=pack_inputs["H"],
-                W=pack_inputs["W"],
-                bin_ids=bin_ids,
-                A_mask=A_mask,
-                quotas=quotas_array,
-                eq_rows=pack_inputs.get("equalizer_edges", {}),
-            )
-
+            # Reuse precheck_diagnostic computed earlier
             return PackResult(
                 status="INFEASIBLE",
                 primal_balance_ok=False,
@@ -160,7 +188,7 @@ def try_pack(
                 cost_equal_ok=False,
                 optimal_cost=None,
                 failure_tier="faces",  # Deterministic - we know it's faces
-                precheck=precheck_result,
+                precheck=precheck_diagnostic,
                 solution=None,
             )
 
@@ -176,25 +204,7 @@ def try_pack(
         # flows.py:342 raises: "WO-07 faces enforcement failed: row {r}, color {c} requires {target} pixels but has 0 allowed. IIS@faces tier."
         if "faces enforcement failed" in msg or "IIS@faces tier" in msg:
             # Convert to faces-tier infeasible for laminar relaxation
-            from .precheck import wo7_precheck
-
-            # Convert quotas dict to array for precheck
-            quotas_dict = pack_inputs["quotas"]
-            S = len(pack_inputs["bins"])
-            C = pack_inputs["C"]
-            quotas_array = np.zeros((S, C), dtype=np.int64)
-            for (s, c), q in quotas_dict.items():
-                quotas_array[s, c] = q
-
-            precheck_result = wo7_precheck(
-                H=pack_inputs["H"],
-                W=pack_inputs["W"],
-                bin_ids=bin_ids,
-                A_mask=A_mask,
-                quotas=quotas_array,
-                eq_rows=pack_inputs.get("equalizer_edges", {}),
-            )
-
+            # Reuse precheck_diagnostic computed earlier
             return PackResult(
                 status="INFEASIBLE",
                 primal_balance_ok=False,
@@ -205,7 +215,7 @@ def try_pack(
                 cost_equal_ok=False,
                 optimal_cost=None,
                 failure_tier="faces",  # KEY: triggers laminar relax to drop faces
-                precheck=precheck_result,
+                precheck=precheck_diagnostic,
                 solution=None,
             )
         else:
@@ -243,27 +253,9 @@ def try_pack(
         )
     else:
         # INFEASIBLE - need to determine tier from precheck
-        from .precheck import wo7_precheck
-
-        # Convert quotas dict to array for precheck
-        quotas_dict = pack_inputs["quotas"]
-        S = len(pack_inputs["bins"])
-        C = pack_inputs["C"]
-        quotas_array = np.zeros((S, C), dtype=np.int64)
-        for (s, c), q in quotas_dict.items():
-            quotas_array[s, c] = q
-
-        precheck_result = wo7_precheck(
-            H=pack_inputs["H"],
-            W=pack_inputs["W"],
-            bin_ids=bin_ids,
-            A_mask=A_mask,
-            quotas=quotas_array,
-            eq_rows=pack_inputs.get("equalizer_edges", {}),
-        )
-
+        # Reuse precheck_diagnostic computed earlier
         # Use structured failure tier inference
-        failure_tier = infer_failure_tier_from_precheck(pack, precheck_result)
+        failure_tier = infer_failure_tier_from_precheck(pack, precheck_diagnostic)
 
         return PackResult(
             status=solution["status"],
@@ -275,7 +267,7 @@ def try_pack(
             cost_equal_ok=False,
             optimal_cost=None,
             failure_tier=failure_tier,
-            precheck=precheck_result,
+            precheck=precheck_diagnostic,
             solution=solution,
         )
 

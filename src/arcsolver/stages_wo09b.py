@@ -255,6 +255,9 @@ def _process_test_packs(
                 "cost_equal_ok": result.cost_equal_ok,
                 "one_of_10_ok": result.one_of_10_ok,
                 "optimal_cost": result.optimal_cost,
+                # WO-B Fix C: Add diagnostic values to receipts
+                "supplies_total": result.precheck.get("supplies_total"),
+                "costs_nonzero_count": result.precheck.get("costs_nonzero_count"),
             }
             packs_tried.append(pack_trial)
             any_feasible = True

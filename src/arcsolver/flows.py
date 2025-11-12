@@ -119,9 +119,21 @@ def load_wo7_inputs(
 
     # Reconstruct quotas from array
     quotas = {}
-    for row in quotas_array:
-        s, c, count = int(row[0]), int(row[1]), int(row[2])
-        quotas[(s, c)] = count
+    if quotas_array.ndim == 2 and quotas_array.shape[1] == 3:
+        # Task-level format: [[s, c, count], ...]
+        for row in quotas_array:
+            s, c, count = int(row[0]), int(row[1]), int(row[2])
+            quotas[(s, c)] = count
+    elif quotas_array.ndim == 2:
+        # Per-canvas format: [num_bins x C] where quotas[s, c] = count
+        num_bins_stored, C_stored = quotas_array.shape
+        for s in range(num_bins_stored):
+            for c in range(C_stored):
+                count = int(quotas_array[s, c])
+                if count > 0:  # Only store non-zero quotas
+                    quotas[(s, c)] = count
+    else:
+        raise ValueError(f"Unexpected quotas_array format: shape {quotas_array.shape}")
 
     # Reconstruct cell_caps from array (if present)
     cell_caps = {}

@@ -283,6 +283,13 @@ def wo4_per_canvas(
             # Bin id: edge_type * 4 + row_parity * 2 + col_parity
             bin_ids[p] = edge_type * 4 + row_parity * 2 + col_parity
 
+    # WO-B Fix: Renumber bin_ids to be consecutive [0, 1, ..., num_bins-1]
+    # Original IDs are non-consecutive (e.g., [0, 4, 8, 12, 16, 17, ...])
+    # Downstream WO-05 quota building expects consecutive range
+    unique_bin_ids = np.unique(bin_ids)
+    bin_id_map = {old_id: new_id for new_id, old_id in enumerate(unique_bin_ids)}
+    bin_ids = np.array([bin_id_map[bid] for bid in bin_ids], dtype=np.int32)
+
     num_bins = len(np.unique(bin_ids))
 
     # Compute hash for determinism
