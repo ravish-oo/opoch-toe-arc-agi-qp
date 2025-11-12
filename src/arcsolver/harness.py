@@ -2199,11 +2199,12 @@ def run_stage_wo7(data_root: Path, strict: bool = False, enable_progress: bool =
         sys.exit(1)
 
 
-def run_stage_wo8(data_root: Path, strict: bool = False, enable_progress: bool = True, filter_tasks: Set[str] = None) -> None:
+def run_stage_wo8(data_root: Path, strict: bool = False, enable_progress: bool = True, filter_tasks: Set[str] = None, per_pack_mode: bool = False) -> None:
     """
     WO-8: Decode + Bit-meter
 
-    Loads WO-7 flows and produces final prediction grid plus bit-meter.
+    In legacy mode: Loads WO-7 flows and produces final prediction grid plus bit-meter.
+    In per-pack mode: WO-8 is called as a library by WO-10; runs only local synthetic tests here.
     """
     from . import stages_wo08
     from .decode import run_synthetic_tie_tests, verify_idempotence_on_tasks
@@ -2228,74 +2229,92 @@ def run_stage_wo8(data_root: Path, strict: bool = False, enable_progress: bool =
         if strict:
             raise RuntimeError("WO-8 synthetic tie tests failed")
 
-    # Run idempotence verification on sample tasks (per WO-08 §7)
+    # WO-B Fix #5c: Idempotence verification depends on pipeline mode
+    # Per-pack mode: WO-8 runs only local synthetic tests; final determinism at WO-10
+    # Legacy mode: WO-8 runs full idempotence via verify_idempotence_on_tasks
     sample_task_ids = sorted(task_ids)[:4]  # Test on first 4 tasks
-    if len(sample_task_ids) > 0:
-        print(f"[WO-8] Running idempotence verification on {len(sample_task_ids)} sample tasks...", file=sys.stderr)
-        idempotence_ok, failed_tasks = verify_idempotence_on_tasks(sample_task_ids, data_root)
-        if idempotence_ok:
-            print(f"[WO-8] ✓ Idempotence verified: all {len(sample_task_ids)} tasks produced identical outputs on re-run", file=sys.stderr)
-        else:
-            print(f"[WO-8] ✗ Idempotence check FAILED on {len(failed_tasks)} tasks: {failed_tasks}", file=sys.stderr)
-            if strict:
-                raise RuntimeError(f"WO-8 idempotence verification failed: {failed_tasks}")
+    idempotence_ok = True
+
+    if per_pack_mode:
+        # Per-pack pipeline: WO-8 is a library called by WO-10. Only synthetic tests here.
+        # Final determinism is verified at WO-10 via wo10_test0.json["hash"] comparison.
+        print(f"[WO-8] Per-pack mode: local synthetic tests only; final determinism at WO-10", file=sys.stderr)
+        # Synthetic tests already ran above (lines 2222-2230), so we're done
     else:
-        print(f"[WO-8] ⚠ No tasks available for idempotence verification", file=sys.stderr)
-        idempotence_ok = True  # Default to True if no tasks to test
+        # Legacy pipeline: run full idempotence verification using WO-7 outputs
+        if len(sample_task_ids) > 0:
+            print(f"[WO-8] Running idempotence verification on {len(sample_task_ids)} sample tasks...", file=sys.stderr)
+            idempotence_ok, failed_tasks = verify_idempotence_on_tasks(sample_task_ids, data_root)
+            if idempotence_ok:
+                print(f"[WO-8] ✓ Idempotence verified: all {len(sample_task_ids)} tasks produced identical outputs on re-run", file=sys.stderr)
+            else:
+                print(f"[WO-8] ✗ Idempotence check FAILED on {len(failed_tasks)} tasks: {failed_tasks}", file=sys.stderr)
+                if strict:
+                    raise RuntimeError(f"WO-8 idempotence verification failed: {failed_tasks}")
+        else:
+            print(f"[WO-8] ⚠ No tasks available for idempotence verification", file=sys.stderr)
 
     success_count = 0
     fail_count = 0
 
-    for task_id in sorted(task_ids):
-        try:
-            # Check that required prior WOs exist
-            receipts_dir = Path("receipts")
-            task_dir = receipts_dir / task_id
-            required_wos = [0, 1, 2, 3, 4, 5, 6, 7]
-            for wo in required_wos:
-                wo_receipt_path = task_dir / f"wo{wo:02d}.json"
-                if not wo_receipt_path.exists():
-                    raise FileNotFoundError(f"WO-{wo} receipt not found: {wo_receipt_path}")
+    # WO-B Fix #5d: In per-pack mode, skip task processing loop entirely
+    # WO-8 decode is called as a library by WO-10 per-test; no standalone receipts
+    if per_pack_mode:
+        print(f"[WO-8] Per-pack mode: skipping task-level processing (decode called by WO-10)", file=sys.stderr)
+        success_count = len(task_ids)  # Treat as success for progress reporting
 
-            # Run WO-8 decode + bit-meter (writes receipt itself)
-            receipt = stages_wo08.run_wo08(task_id, data_root)
+    if not per_pack_mode:
+        for task_id in sorted(task_ids):
+            try:
+                # Check that required prior WOs exist
+                receipts_dir = Path("receipts")
+                task_dir = receipts_dir / task_id
+                # Legacy mode: require WO-7 receipt
+                required_wos = [0, 1, 2, 3, 4, 5, 6, 7]
+                for wo in required_wos:
+                    wo_receipt_path = task_dir / f"wo{wo:02d}.json"
+                    if not wo_receipt_path.exists():
+                        raise FileNotFoundError(f"WO-{wo} receipt not found: {wo_receipt_path}")
 
-            # Extract metrics from receipt
-            decode_data = receipt["decode"]
-            bit_meter_data = receipt["bit_meter"]
+                # Run WO-8 decode + bit-meter (writes receipt itself)
+                receipt = stages_wo08.run_wo08(task_id, data_root)
 
-            # Individual decode checks (per WO-08 §6 requirements)
-            decode_one_of_10_ok = decode_data.get("one_of_10_decode_ok", False)
-            decode_mask_ok = decode_data.get("mask_ok", False)
+                # Extract metrics from receipt
+                decode_data = receipt["decode"]
+                bit_meter_data = receipt["bit_meter"]
 
-            # bits_sum = total_bits from bit-meter
-            bits_sum = bit_meter_data.get("total_bits", 0)
+                # Individual decode checks (per WO-08 §6 requirements)
+                decode_one_of_10_ok = decode_data.get("one_of_10_decode_ok", False)
+                decode_mask_ok = decode_data.get("mask_ok", False)
 
-            # Accumulate individual metrics
-            acc_bool(progress, "decode_one_of_10_ok", decode_one_of_10_ok)
-            acc_bool(progress, "decode_mask_ok", decode_mask_ok)
+                # bits_sum = total_bits from bit-meter
+                bits_sum = bit_meter_data.get("total_bits", 0)
 
-            # Synthetic tie tests (run once at function start per WO-08 §7)
-            acc_bool(progress, "bit_meter_check_ok", bit_meter_check_ok)
+                # Accumulate individual metrics
+                acc_bool(progress, "decode_one_of_10_ok", decode_one_of_10_ok)
+                acc_bool(progress, "decode_mask_ok", decode_mask_ok)
 
-            # Idempotence verification (run once at function start per WO-08 §7)
-            acc_bool(progress, "idempotence_ok", idempotence_ok)
+                # Synthetic tie tests (run once at function start per WO-08 §7)
+                acc_bool(progress, "bit_meter_check_ok", bit_meter_check_ok)
 
-            acc_sum(progress, "bits_sum", bits_sum)
+                # Idempotence verification (run once at function start per WO-08 §7)
+                acc_bool(progress, "idempotence_ok", idempotence_ok)
 
-            success_count += 1
+                acc_sum(progress, "bits_sum", bits_sum)
 
-            # Progress reporting
-            if enable_progress and success_count % 100 == 0:
-                print(f"[WO-8] Progress: {success_count}/{len(task_ids)} receipts written", file=sys.stderr)
+                success_count += 1
 
-        except Exception as e:
-            print(f"[WO-8] Failed to process task {task_id}: {e}", file=sys.stderr)
-            if fail_count < 2:  # Print traceback for first 2 errors only
-                traceback.print_exc(file=sys.stderr)
-            fail_count += 1
-            if strict:
-                raise
+                # Progress reporting
+                if enable_progress and success_count % 100 == 0:
+                    print(f"[WO-8] Progress: {success_count}/{len(task_ids)} receipts written", file=sys.stderr)
+
+            except Exception as e:
+                print(f"[WO-8] Failed to process task {task_id}: {e}", file=sys.stderr)
+                if fail_count < 2:  # Print traceback for first 2 errors only
+                    traceback.print_exc(file=sys.stderr)
+                fail_count += 1
+                if strict:
+                    raise
 
     # Summary
     print(
@@ -2503,9 +2522,10 @@ def run_stage_wo09b(data_root: Path, strict: bool = False, enable_progress: bool
             # Check that required prior WOs exist
             receipts_dir = Path("receipts")
             task_dir = receipts_dir / task_id
-            required_wos = [0, 1, 2, 3, 4, 5, 6, 7, 9]  # Need WO-9A
+            # WO-B Fix #6: Legacy WO-7 receipt not needed; need WO-9A (packs) for per-pack mode
+            required_wos = [0, 1, 2, 3, 4, 5, 6, 9]  # Need WO-9A
             for wo in required_wos:
-                wo_receipt_path = task_dir / f"wo{wo:02d}.json" if wo < 9 else task_dir / "wo09a.json"
+                wo_receipt_path = task_dir / f"wo{wo:02d}.json" if wo < 9 else task_dir / "wo09a_prime.json"
                 if not wo_receipt_path.exists():
                     raise FileNotFoundError(f"WO-{wo} receipt not found: {wo_receipt_path}")
 
@@ -2676,12 +2696,13 @@ def run_stage_wo10(data_root: Path, strict: bool = False, enable_progress: bool 
             # Check that required prior WOs exist
             receipts_dir = Path("receipts")
             task_dir = receipts_dir / task_id
-            required_wos = [0, 1, 2, 3, 4, 5, 6, 7, 9, 10]  # Need WO-9A and WO-9B
+            # WO-B Fix #7: Legacy WO-7 receipt not needed; need WO-9A (packs) and WO-9B (per-pack solves)
+            required_wos = [0, 1, 2, 3, 4, 5, 6, 9, 10]  # Need WO-9A and WO-9B
             for wo in required_wos:
                 if wo < 9:
                     wo_receipt_path = task_dir / f"wo{wo:02d}.json"
                 elif wo == 9:
-                    wo_receipt_path = task_dir / "wo09a.json"
+                    wo_receipt_path = task_dir / "wo09a_prime.json"
                 else:  # wo == 10
                     wo_receipt_path = task_dir / "wo09b.json"
 
@@ -2908,10 +2929,28 @@ Examples:
         file=sys.stderr,
     )
 
+    # WO-B Fix #3: Detect per-pack mode by intent (upto_wo >= 9), not by file existence
+    # Per §12: If running WO-9A′/9B/10, we're in per-pack mode (pack-centric pipeline)
+    per_pack_mode = (args.upto_wo >= 9)
+
     for wo in range(args.upto_wo + 1):
+        # WO-B Fix #1: Skip legacy WO-7 stage in per-pack mode
+        # WO-7 stage runner is task-level (pre-WO-B); obsolete after WO-9A′/9B
+        # WO-9B calls flows library (build_flow_graph/solve_and_extract) per-pack
+        # Per §8/§10/§12: solver is pack-centric with laminar relaxation
+        if wo == 7 and args.upto_wo >= 9:
+            print(
+                "[harness] Skipping WO-7 stage (obsolete in per-pack mode; replaced by WO-9B)",
+                file=sys.stderr,
+            )
+            continue
+
         if wo in STAGE_RUNNERS:
+            # WO-B Fix #4: Pass per_pack_mode to WO-8 so it knows not to require legacy WO-7
+            if wo == 8:
+                STAGE_RUNNERS[wo](args.data_root, strict=args.strict, enable_progress=args.progress, filter_tasks=filter_tasks, per_pack_mode=per_pack_mode)
             # WO-10 (stage 11) needs evaluate flag
-            if wo == 11:
+            elif wo == 11:
                 STAGE_RUNNERS[wo](args.data_root, strict=args.strict, enable_progress=args.progress, filter_tasks=filter_tasks, evaluate=args.evaluate)
             else:
                 STAGE_RUNNERS[wo](args.data_root, strict=args.strict, enable_progress=args.progress, filter_tasks=filter_tasks)

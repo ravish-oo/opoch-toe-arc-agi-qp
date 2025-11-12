@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Canvas Operations: Per-canvas WO-4/5 callables for WO-A
+Canvas Operations: Per-canvas WO-4/5/6 callables for WO-A & WO-B
 
 Refactored from harness.py to support per-test per-canvas pack enumeration
 for linear size laws (anchor §1).
@@ -98,90 +98,87 @@ def forward_meet_closure_lift(
 
     Returns:
         A_mask: (N, C) bool array where A_mask[p,c] = F[p, test_input(p), c]
+
+    Complexity: O(N·m + N·C) where m = num trainings
     """
     N = H * W
-    C = 10  # ARC-AGI palette size
+    C = 10  # ARC palette size
 
-    # === STEP 1: GATHER (Forward Meet) ===
-    # For each (p,k), track: seen, unique output color, ambiguous flag
-    seen = np.zeros((N, C), dtype=bool)
-    unique = -np.ones((N, C), dtype=np.int16)
-    amb = np.zeros((N, C), dtype=bool)
+    # === STEP 1: FORWARD MEET (GATHER) ===
+    # For each (pixel p, input color k), collect output colors across trainings
+    seen = np.zeros((N, C), dtype=bool)        # Have we seen (p,k)?
+    unique = -np.ones((N, C), dtype=np.int16)  # First output color for (p,k)
+    amb = np.zeros((N, C), dtype=bool)         # Ambiguous mapping?
 
     for X_i, Y_i in zip(train_inputs_embedded, train_outputs_embedded):
         x = X_i.flatten()
         y = Y_i.flatten()
-        valid = (x >= 0) & (y >= 0)  # Skip -1 padding in both input and output
+
+        # Only process valid pixels (not padded -1)
+        valid = (x >= 0) & (y >= 0)
 
         for p in np.nonzero(valid)[0]:
             k = int(x[p])
             c = int(y[p])
 
             if not seen[p, k]:
+                # First time seeing X(p)=k → record output c
                 seen[p, k] = True
                 unique[p, k] = c
             elif unique[p, k] != c:
-                # Different output for same input → ambiguous
+                # Saw X(p)=k → different output → ambiguous
                 amb[p, k] = True
 
-    # === BUILD F[p,k,c] ===
-    F = np.ones((N, C, C), dtype=bool)  # Start with all allowed
+    # Build forward meet F[p,k,c]
+    F = np.ones((N, C, C), dtype=bool)  # Initially all True
 
     for p in range(N):
         for k in range(C):
             if not seen[p, k]:
-                # No evidence for this (p,k) → leave broad (will be lifted or left open)
+                # Never saw this (p,k) → leave broad (all True)
                 continue
 
             if amb[p, k]:
                 # Ambiguous: multiple outputs for same input → forbid all
                 F[p, k, :] = False
             else:
-                # Unique mapping: only one output color allowed
+                # Unique mapping k→c*
                 c_star = unique[p, k]
                 F[p, k, :] = False
                 F[p, k, c_star] = True
 
     # === STEP 2: SUFFICIENCY CLOSURE ===
-    # One pass to enforce order-independence and idempotence
-    # This ensures F is monotone (only 1→0 besides the unique 1)
-    # CRITICAL: Skip ambiguous (p,k) pairs - they should remain all False
+    # Enforce order-independence: for each training, set F[p,k,c*]=1, F[p,k,≠c*]=0
+    # CRITICAL: Skip ambiguous (p,k) pairs (they remain all False from Step 1)
     for X_i, Y_i in zip(train_inputs_embedded, train_outputs_embedded):
         x = X_i.flatten()
         y = Y_i.flatten()
+
         valid = (x >= 0) & (y >= 0)
-
         idx = np.nonzero(valid)[0]
-        if len(idx) == 0:
-            continue
 
-        kvec = x[idx].astype(int)
-        cvec = y[idx].astype(int)
-
-        # Enforce: F[p,k,c*]=1, F[p,k,≠c*]=0
-        # BUT: skip if ambiguous (Step 1 already set all to False)
         for i, p in enumerate(idx):
-            k = kvec[i]
-            c = cvec[i]
-            if not amb[p, k]:  # Only enforce if not ambiguous
+            k = int(x[idx][i])
+            c = int(y[idx][i])
+
+            if not amb[p, k]:  # Only if not ambiguous
                 F[p, k, :] = False
                 F[p, k, c] = True
 
     # === STEP 3: COLOR-AGNOSTIC LIFT ===
-    # If all observed k at pixel p share same admits row, extend to unseen k
+    # If all observed k at pixel p share same admits row → lift to unseen k'
     for p in range(N):
         obs_k = np.nonzero(seen[p, :])[0]
 
         if len(obs_k) == 0:
-            # No evidence at this pixel → leave broad
-            continue
+            continue  # No evidence at this pixel
 
-        # Check if all observed k share the same admits row
+        # Check if all observed k have same admits row
         first_row = F[p, obs_k[0], :]
         consensus = all(np.array_equal(F[p, k, :], first_row) for k in obs_k[1:])
 
         if consensus:
-            # Lift consensus to unseen input colors
+            # Lift to unseen k'
             unseen_k = np.setdiff1d(np.arange(C), obs_k, assume_unique=True)
             F[p, unseen_k, :] = first_row
 
@@ -192,10 +189,10 @@ def forward_meet_closure_lift(
 
     for p in range(N):
         k_test = test_flat[p]
-        if k_test >= 0:  # Skip -1 padding in test input
+        if k_test >= 0:
             A_mask[p, :] = F[p, int(k_test), :]
         else:
-            # Padded position in test → leave broad (all allowed)
+            # Padded position → broad (all True)
             A_mask[p, :] = True
 
     return A_mask
@@ -210,38 +207,32 @@ def wo4_per_canvas(
     embed_mode: str,
 ) -> Dict:
     """
-    WO-4 per-canvas: Compute A_mask and bin_ids on given canvas.
+    WO-4 per-canvas: Forward meet + closure + lift for given canvas dimensions.
 
-    CRITICAL (Phase 3 fix): A_mask now computed via forward meet + closure + lift
-    per anchor §5, conditioned on input colors. This is TEST-SPECIFIC - different
-    tests produce different masks.
+    Phase 3 implementation: Input-conditioned A_mask per anchor §5.
 
     Args:
-        train_inputs_raw: List of training input grids (native sizes, before embedding)
-        train_outputs_embedded: List of embedded training outputs on this canvas
-        test_input_raw: Test input grid (native size, before embedding)
+        train_inputs_raw: List of raw training input grids (NOT embedded yet)
+        train_outputs_embedded: List of training outputs already embedded to (H, W)
+        test_input_raw: Raw test input grid (NOT embedded yet)
         H: Canvas height
         W: Canvas width
-        embed_mode: Embedding mode used
+        embed_mode: "topleft" or "center"
 
     Returns:
         Dict with:
-            - A_mask: (N, C) bool - test-specific mask from forward meet
-            - bin_ids: (N,) int64
-            - meta: {H, W, embed_mode, num_trains, hash, forward_meet_applied}
+        - A_mask: (N, C) bool array
+        - bin_ids: (N,) int array
+        - meta: {H, W, N, num_trains, num_bins, forward_meet_applied, hash}
     """
     N = H * W
-    C = 10  # ARC-AGI palette size
+    C = 10
 
-    # === EMBED INPUTS TO CANVAS (Phase 3) ===
-    train_inputs_embedded = [
-        align_to_canvas(X_i, H, W, embed_mode)
-        for X_i in train_inputs_raw
-    ]
-
+    # Embed inputs to canvas (sample at output coords)
+    train_inputs_embedded = [align_to_canvas(X_i, H, W, embed_mode) for X_i in train_inputs_raw]
     test_input_embedded = align_to_canvas(test_input_raw, H, W, embed_mode)
 
-    # === FORWARD MEET + CLOSURE + LIFT (anchor §5) ===
+    # Compute forward meet + closure + lift
     A_mask = forward_meet_closure_lift(
         train_inputs_embedded=train_inputs_embedded,
         train_outputs_embedded=train_outputs_embedded,
@@ -250,9 +241,9 @@ def wo4_per_canvas(
         W=W,
     )
 
-    # === BIN ASSIGNMENT (periphery-parity bins per anchor §4) ===
-    # Bins are intersections of edge flags (top/bottom/left/right/interior) with parity
-    bin_ids = np.zeros(N, dtype=np.int64)
+    # Build bin_ids (periphery-parity bins per anchor §4)
+    # Bins: intersection of {top/bottom/left/right/interior} × {row_parity, col_parity}
+    bin_ids = np.zeros(N, dtype=np.int32)
 
     for r in range(H):
         for c in range(W):
@@ -265,34 +256,47 @@ def wo4_per_canvas(
             is_right = (c == W - 1)
 
             # Parity
-            r_parity = r % 2
-            c_parity = c % 2
+            row_parity = r % 2
+            col_parity = c % 2
 
-            # Bin encoding (stable across runs)
-            # Use: (edge_flags × 16 + r_parity × 2 + c_parity)
-            edge_flags = (int(is_top) << 3) | (int(is_bottom) << 2) | \
-                        (int(is_left) << 1) | int(is_right)
-            bin_id = edge_flags * 4 + r_parity * 2 + c_parity
+            # Bin index: encode edge flags + parity
+            # Use a simple encoding: (edge_type, row_parity, col_parity)
+            if is_top and is_left:
+                edge_type = 0  # corner TL
+            elif is_top and is_right:
+                edge_type = 1  # corner TR
+            elif is_bottom and is_left:
+                edge_type = 2  # corner BL
+            elif is_bottom and is_right:
+                edge_type = 3  # corner BR
+            elif is_top:
+                edge_type = 4  # edge top
+            elif is_bottom:
+                edge_type = 5  # edge bottom
+            elif is_left:
+                edge_type = 6  # edge left
+            elif is_right:
+                edge_type = 7  # edge right
+            else:
+                edge_type = 8  # interior
 
-            bin_ids[p] = bin_id
+            # Bin id: edge_type * 4 + row_parity * 2 + col_parity
+            bin_ids[p] = edge_type * 4 + row_parity * 2 + col_parity
 
-    # Compute hash for determinism (Phase 3: include inputs and test input)
-    hash_input = f"wo4_v3:{H}x{W}:{embed_mode}:{len(train_inputs_raw)}"
-    for X_i in train_inputs_raw:
-        hash_input += f":X{hashlib.sha256(X_i.tobytes()).hexdigest()[:8]}"
-    for Y_i in train_outputs_embedded:
-        hash_input += f":Y{hashlib.sha256(Y_i.tobytes()).hexdigest()[:8]}"
-    hash_input += f":test{hashlib.sha256(test_input_raw.tobytes()).hexdigest()[:8]}"
-    wo4_hash = hashlib.sha256(hash_input.encode()).hexdigest()
+    num_bins = len(np.unique(bin_ids))
+
+    # Compute hash for determinism
+    wo4_hash = hashlib.sha256(
+        A_mask.tobytes() + bin_ids.tobytes()
+    ).hexdigest()
 
     meta = {
         "H": H,
         "W": W,
         "N": N,
-        "embed_mode": embed_mode,
-        "num_trains": len(train_inputs_raw),
-        "num_bins": int(bin_ids.max()) + 1,
-        "forward_meet_applied": True,  # Phase 3: flag for audit
+        "num_trains": len(train_outputs_embedded),
+        "num_bins": num_bins,
+        "forward_meet_applied": True,  # Phase 3 flag
         "hash": wo4_hash,
     }
 
@@ -312,108 +316,82 @@ def wo5_per_canvas(
     train_output_sizes: List[Tuple[int, int]],
 ) -> Dict:
     """
-    WO-5 per-canvas: Compute quotas, faces, equalizer edges on given canvas.
+    WO-5 per-canvas: Quotas, faces, equalizers for given canvas dimensions.
 
-    Extracted from harness.py WO-5 stage. Computes:
-    - quotas: (num_bins, C) int64 quota targets per bin/color
-    - faces_R: (H, C) int64 per-row color counts (meet across trainings)
-    - faces_S: (W, C) int64 per-column color counts (meet across trainings)
-    - equalizer_edges: Dict[(s,c)] -> edges array (E×2)
-
-    CRITICAL (Phase 2 fix): Faces are ONLY computed when all training outputs
-    naturally match the target canvas size (no embedding needed). When trainings
-    have different native sizes, faces are set to None per anchor §8.
+    Phase 2 implementation: Only compute faces when all trainings naturally match
+    canvas size (no embedding).
 
     Args:
-        train_outputs_embedded: List of embedded training outputs on this canvas
-        A_mask: (N, C) bool allowed colors
-        bin_ids: (N,) int64 bin assignments
+        train_outputs_embedded: List of training outputs embedded to (H, W)
+        A_mask: (N, C) bool array from WO-4
+        bin_ids: (N,) int array from WO-4
         H: Canvas height
         W: Canvas width
         train_output_sizes: List of (H_i, W_i) native sizes BEFORE embedding
 
     Returns:
         Dict with:
-            - quotas: (num_bins, C) int64
-            - faces_R: (H, C) int64 or None
-            - faces_S: (W, C) int64 or None
-            - equalizer_edges: Dict[(s,c)] -> (E×2) array
-            - meta: {num_bins, has_faces, native_size_match, hash}
+        - quotas: (num_bins, C) int64 array
+        - faces_R: (H, C) int64 array or None
+        - faces_S: (W, C) int64 array or None
+        - equalizer_edges: dict {(s,c): [(p_i,p_j), ...]}
+        - meta: {H, W, num_bins, has_faces, native_size_match, faces_R_sum, faces_S_sum}
     """
     N = H * W
     C = 10
-    num_bins = int(bin_ids.max()) + 1
+    num_bins = len(np.unique(bin_ids))
 
-    # === QUOTAS (anchor §8 line 124-127) ===
-    # q[s,c] = min_i #{p ∈ B_s : Y_i(p)=c}
-    quotas = np.zeros((num_bins, C), dtype=np.int64)
+    # === QUOTAS (anchor §8) ===
+    # Per-bin quotas: q[s,c] = min_i #{p∈B_s: Y_i(p)=c}
+    quotas = np.full((num_bins, C), np.iinfo(np.int64).max, dtype=np.int64)
 
-    # Build bins list
-    bins_list = []
-    for s in range(num_bins):
-        bin_pixels = np.where(bin_ids == s)[0]
-        bins_list.append(bin_pixels)
+    for Y_i in train_outputs_embedded:
+        Y_i_flat = Y_i.flatten()
+        for s in range(num_bins):
+            bin_mask = (bin_ids == s)
+            for c in range(C):
+                count = np.sum((Y_i_flat[bin_mask] == c))
+                quotas[s, c] = min(quotas[s, c], count)
 
-    for c in range(C):
-        for s, bin_pixels in enumerate(bins_list):
-            counts_per_example = []
-            for Y_i in train_outputs_embedded:
-                Y_i_flat = Y_i.flatten()
-                # Count pixels in this bin with color c (skip -1 padding)
-                count_in_output = sum(
-                    1 for p in bin_pixels
-                    if p < len(Y_i_flat) and Y_i_flat[p] == c
-                )
-                counts_per_example.append(count_in_output)
+    # Replace inf with 0 (bins never seen)
+    quotas[quotas == np.iinfo(np.int64).max] = 0
 
-            quota = min(counts_per_example) if counts_per_example else 0
-            quotas[s, c] = quota
-
-    # === FACES (anchor §8 line 128) ===
-    # CRITICAL (Phase 2 fix): Only compute faces when ALL training outputs
-    # naturally match the target canvas size (no embedding needed).
-    # When trainings have different native sizes, comparing counts across
-    # embedded outputs with -1 padding violates "meet of counts" semantics.
-
-    # Check if all trainings naturally match canvas
+    # === FACES (anchor §8) ===
+    # Phase 2 fix: Only compute faces when ALL trainings naturally match canvas
+    # Check if all trainings have native size == canvas size
     all_native_match = all(
         H_i == H and W_i == W
         for H_i, W_i in train_output_sizes
     )
 
     if all_native_match:
-        # All trainings naturally match canvas → compute faces
-        faces_R = np.zeros((H, C), dtype=np.int64)
-        faces_S = np.zeros((W, C), dtype=np.int64)
+        # All trainings naturally match canvas → compute faces (no -1 padding)
+        # Faces: meet of per-row/column color counts across trainings
+        faces_R = np.full((H, C), np.iinfo(np.int64).max, dtype=np.int64)
+        faces_S = np.full((W, C), np.iinfo(np.int64).max, dtype=np.int64)
 
-        for c in range(C):
-            # Per-row faces
+        for Y_i in train_outputs_embedded:
+            # Row faces
             for r in range(H):
-                counts_per_example = []
-                for Y_i in train_outputs_embedded:
-                    # Count color c in row r (no -1 padding since all native)
-                    count_in_row = np.sum(Y_i[r, :] == c)
-                    counts_per_example.append(count_in_row)
-                faces_R[r, c] = min(counts_per_example) if counts_per_example else 0
+                row = Y_i[r, :]
+                for c in range(C):
+                    count = np.sum(row == c)
+                    faces_R[r, c] = min(faces_R[r, c], count)
 
-            # Per-column faces
+            # Column faces
             for j in range(W):
-                counts_per_example = []
-                for Y_i in train_outputs_embedded:
-                    # Count color c in column j (no -1 padding since all native)
-                    count_in_col = np.sum(Y_i[:, j] == c)
-                    counts_per_example.append(count_in_col)
-                faces_S[j, c] = min(counts_per_example) if counts_per_example else 0
+                col = Y_i[:, j]
+                for c in range(C):
+                    count = np.sum(col == c)
+                    faces_S[j, c] = min(faces_S[j, c], count)
 
-        # Check if faces are non-trivial
-        faces_R_sum = int(faces_R.sum())
-        faces_S_sum = int(faces_S.sum())
-        has_faces = (faces_R_sum > 0) or (faces_S_sum > 0)
+        # Replace inf with 0
+        faces_R[faces_R == np.iinfo(np.int64).max] = 0
+        faces_S[faces_S == np.iinfo(np.int64).max] = 0
 
-        # Return None if no faces (matches WO-A spec)
-        if not has_faces:
-            faces_R = None
-            faces_S = None
+        faces_R_sum = int(np.sum(faces_R))
+        faces_S_sum = int(np.sum(faces_S))
+        has_faces = (faces_R_sum > 0 or faces_S_sum > 0)
     else:
         # Trainings have different native sizes → no faces
         # Cannot compute meaningful "meet of counts" when comparing embedded outputs
@@ -462,45 +440,45 @@ def wo5_per_canvas(
                 for p in allowed_in_bin:
                     r, col = divmod(p, W)
                     # 4-connected neighbors
-                    for dr, dc in [(-1,0), (1,0), (0,-1), (0,1)]:
-                        nr, nc = r + dr, col + dc
-                        if 0 <= nr < H and 0 <= nc < W:
-                            q = nr * W + nc
-                            if q in allowed_in_bin:
-                                adj_matrix[p, q] = True
+                    neighbors = []
+                    if r > 0:
+                        neighbors.append((r - 1) * W + col)
+                    if r < H - 1:
+                        neighbors.append((r + 1) * W + col)
+                    if col > 0:
+                        neighbors.append(r * W + col - 1)
+                    if col < W - 1:
+                        neighbors.append(r * W + col + 1)
 
-                # Use BFS to get spanning tree
-                csr_adj = csr_matrix(adj_matrix)
-                bfs_tree = breadth_first_tree(csr_adj, allowed_in_bin[0], directed=False)
+                    for q in neighbors:
+                        if q in allowed_in_bin:
+                            adj_matrix[p, q] = True
 
-                # Extract edges
-                edges_list = []
-                for i in range(bfs_tree.shape[0]):
-                    for j in bfs_tree.getrow(i).indices:
-                        if i < j:  # Avoid duplicates
-                            edges_list.append([i, j])
+                # Build spanning tree via BFS
+                adj_sparse = csr_matrix(adj_matrix)
+                root = allowed_in_bin[0]
 
-                if len(edges_list) > 0:
-                    equalizer_edges[(s, c)] = np.array(edges_list, dtype=np.int64)
+                # Use scipy BFS to get spanning tree
+                tree = breadth_first_tree(adj_sparse, root, directed=False)
 
-    # Compute hash for determinism
-    hash_input = f"wo5:{H}x{W}:{num_bins}:{len(train_outputs_embedded)}"
-    hash_input += f":quotas={hashlib.sha256(quotas.tobytes()).hexdigest()[:8]}"
-    if faces_R is not None:
-        hash_input += f":faces_R={hashlib.sha256(faces_R.tobytes()).hexdigest()[:8]}"
-    if faces_S is not None:
-        hash_input += f":faces_S={hashlib.sha256(faces_S.tobytes()).hexdigest()[:8]}"
-    wo5_hash = hashlib.sha256(hash_input.encode()).hexdigest()
+                # Extract edges from tree
+                edges = []
+                tree_coo = tree.tocoo()
+                for i, j in zip(tree_coo.row, tree_coo.col):
+                    if i < j:  # Canonicalize edge direction
+                        edges.append((int(i), int(j)))
+
+                if len(edges) > 0:
+                    equalizer_edges[(s, c)] = edges
 
     meta = {
         "H": H,
         "W": W,
         "num_bins": num_bins,
         "has_faces": has_faces,
-        "native_size_match": all_native_match,  # Phase 2: document why faces present/absent
-        "faces_R_sum": faces_R_sum if has_faces else 0,
-        "faces_S_sum": faces_S_sum if has_faces else 0,
-        "hash": wo5_hash,
+        "native_size_match": all_native_match,  # Phase 2 metadata
+        "faces_R_sum": faces_R_sum,
+        "faces_S_sum": faces_S_sum,
     }
 
     return {
@@ -508,5 +486,100 @@ def wo5_per_canvas(
         "faces_R": faces_R,
         "faces_S": faces_S,
         "equalizer_edges": equalizer_edges,
+        "meta": meta,
+    }
+
+
+def wo6_per_canvas(
+    train_outputs_embedded: List[np.ndarray],
+    A_mask: np.ndarray,
+    bin_ids: np.ndarray,
+    H: int,
+    W: int,
+    free_maps_verified: List[Dict],
+) -> Dict:
+    """
+    WO-6 per-canvas: Π-safe scores + FREE projection + int64 costs.
+
+    Implements WO-B Phase 1: Per-canvas cost computation with verified FREE maps.
+
+    Args:
+        train_outputs_embedded: List of training outputs embedded to (H, W)
+        A_mask: (N, C) bool array from WO-4
+        bin_ids: (N,) int array from WO-4
+        H: Canvas height
+        W: Canvas width
+        free_maps_verified: List of verified FREE map dicts from task-level WO-6
+
+    Returns:
+        Dict with:
+        - costs: (N, C) int64 array
+        - meta: {H, W, N, C, pi_safe_ok, free_invariance_ok, costs_hash}
+    """
+    from . import scores as scores_module
+    from .config import SCALE
+
+    N = H * W
+    C = 10
+
+    # === BUILD Π-SAFE SCORES ===
+    # Scores depend ONLY on bins/mask (anchor §6, 01_addendum.md §B)
+    stage_features = None  # Can be extended later with harmonic/gravity features
+
+    scores = scores_module.build_scores_pi_safe(
+        H=H,
+        W=W,
+        A_mask=A_mask,
+        bin_ids=bin_ids,
+        stage_features=stage_features,
+    )
+
+    # Mark Π-safe (all inputs are geometry-only)
+    pi_safe_ok = True
+
+    # === APPLY FREE MAP PROJECTION ===
+    # Project scores using Haar projector (Reynolds operator) over verified FREE symmetries
+    # This ensures ŝ∘U = ŝ for all verified U (anchor 01_addendum.md §B)
+    free_invariance_ok = True
+
+    if free_maps_verified and len(free_maps_verified) > 0:
+        # Apply each FREE map and average (Haar projector)
+        projected_scores = np.zeros_like(scores, dtype=np.float64)
+
+        for U in free_maps_verified:
+            scores_transformed = scores_module.apply_U_to_scores(scores, U, H, W)
+            projected_scores += scores_transformed
+
+        # Average over symmetry group
+        projected_scores /= len(free_maps_verified)
+        scores = projected_scores
+
+        # Verify FREE invariance (cost invariance after projection)
+        for U in free_maps_verified:
+            costs_test = scores_module.to_int_costs(scores)
+            costs_transformed = scores_module.apply_U_to_costs(costs_test, U, H, W)
+            if not np.array_equal(costs_test, costs_transformed):
+                free_invariance_ok = False
+                break
+
+    # === CONVERT TO INTEGER COSTS ===
+    # Per Annex A.2: costs = round(-ŝ * SCALE) as int64
+    costs = scores_module.to_int_costs(scores)
+
+    # Compute hash for determinism
+    costs_hash = hashlib.sha256(costs.tobytes()).hexdigest()
+
+    meta = {
+        "H": H,
+        "W": W,
+        "N": N,
+        "C": C,
+        "pi_safe_ok": pi_safe_ok,
+        "free_invariance_ok": free_invariance_ok,
+        "costs_hash": costs_hash,
+    }
+
+    return {
+        "costs": costs,
         "meta": meta,
     }

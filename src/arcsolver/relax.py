@@ -165,8 +165,52 @@ def try_pack(
             )
 
     # Build flow graph and solve
-    mcf, metadata = flows.build_flow_graph(pack_inputs)
-    solution = flows.solve_and_extract(mcf, metadata)
+    # WO-B Fix #2: Catch faces enforcement failures during graph construction
+    # Per §10 laminar precedence: faces-tier failures must trigger relaxation, not crash
+    try:
+        mcf, metadata = flows.build_flow_graph(pack_inputs)
+        solution = flows.solve_and_extract(mcf, metadata)
+    except ValueError as e:
+        msg = str(e)
+        # Check if this is a faces enforcement failure
+        # flows.py:342 raises: "WO-07 faces enforcement failed: row {r}, color {c} requires {target} pixels but has 0 allowed. IIS@faces tier."
+        if "faces enforcement failed" in msg or "IIS@faces tier" in msg:
+            # Convert to faces-tier infeasible for laminar relaxation
+            from .precheck import wo7_precheck
+
+            # Convert quotas dict to array for precheck
+            quotas_dict = pack_inputs["quotas"]
+            S = len(pack_inputs["bins"])
+            C = pack_inputs["C"]
+            quotas_array = np.zeros((S, C), dtype=np.int64)
+            for (s, c), q in quotas_dict.items():
+                quotas_array[s, c] = q
+
+            precheck_result = wo7_precheck(
+                H=pack_inputs["H"],
+                W=pack_inputs["W"],
+                bin_ids=bin_ids,
+                A_mask=A_mask,
+                quotas=quotas_array,
+                eq_rows=pack_inputs.get("equalizer_edges", {}),
+            )
+
+            return PackResult(
+                status="INFEASIBLE",
+                primal_balance_ok=False,
+                capacity_ok=False,
+                mask_ok=True,  # Mask is fine, it's faces that failed
+                one_of_10_ok=False,
+                cell_caps_ok=True,  # Cell caps are fine, it's faces that failed
+                cost_equal_ok=False,
+                optimal_cost=None,
+                failure_tier="faces",  # KEY: triggers laminar relax to drop faces
+                precheck=precheck_result,
+                solution=None,
+            )
+        else:
+            # Not a faces error, re-raise
+            raise
 
     # Run checks
     if solution["status"] == "OPTIMAL":

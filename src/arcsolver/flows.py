@@ -29,11 +29,23 @@ from .config import SCALE
 from .scores import to_int_costs
 
 
-def load_wo7_inputs(task_id: str, data_root: Path) -> Dict:
+def load_wo7_inputs(
+    task_id: str,
+    data_root: Path,
+    test_idx: Optional[int] = None,
+    canvas_id: Optional[str] = None,
+) -> Dict:
     """
-    Load all required inputs from WO-04 and WO-06 caches.
+    Load all required inputs from WO-04/05/06 caches.
 
-    This loads materialized artifacts from .cache/ for fast WO-7 iteration.
+    WO-B (per-canvas): Requires test_idx and canvas_id to load per-canvas caches.
+    Legacy (task-level): Omit test_idx and canvas_id for backwards compatibility.
+
+    Args:
+        task_id: Task ID
+        data_root: Path to data directory
+        test_idx: Test index (required for per-canvas)
+        canvas_id: Canvas ID (required for per-canvas)
 
     Returns dict with:
         H, W, C, N: grid dimensions
@@ -47,36 +59,57 @@ def load_wo7_inputs(task_id: str, data_root: Path) -> Dict:
     """
     from . import cache as cache_module
 
-    # Load WO-04 cache for A_mask and bin_ids
-    cache_wo4 = cache_module.load_cache(4, task_id, data_root)
-    if cache_wo4 is None:
-        raise FileNotFoundError(f"WO-04 cache not found for task {task_id}. Run WO-04 first.")
+    cache_root = data_root.parent / ".cache"
+    per_canvas_mode = (test_idx is not None and canvas_id is not None)
+
+    # === LOAD WO-04 CACHE (A_mask, bin_ids) ===
+    if per_canvas_mode:
+        # Per-canvas: .cache/wo04/{task_id}.{test_idx}.{canvas_id}.npz
+        wo4_cache_path = cache_root / "wo04" / f"{task_id}.{test_idx}.{canvas_id}.npz"
+        if not wo4_cache_path.exists():
+            raise FileNotFoundError(f"WO-04 per-canvas cache not found: {wo4_cache_path}")
+        cache_wo4 = np.load(wo4_cache_path)
+        # Extract H, W from metadata
+        H = int(cache_wo4.get("meta_H", 0))
+        W = int(cache_wo4.get("meta_W", 0))
+        C = 10
+        N = H * W
+    else:
+        # Task-level (legacy): .cache/wo04/{task_id}.npz
+        cache_wo4 = cache_module.load_cache(4, task_id, data_root)
+        if cache_wo4 is None:
+            raise FileNotFoundError(f"WO-04 cache not found for task {task_id}. Run WO-04 first.")
+        manifest = cache_wo4.get("_manifest", {})
+        H = manifest.get("H")
+        W = manifest.get("W")
+        C = manifest.get("C", 10)
+        N = manifest.get("N")
+
+    if H is None or W is None or N is None or H == 0 or W == 0 or N == 0:
+        raise ValueError(f"WO-04 cache missing dimensions for task {task_id}")
 
     A_mask = cache_wo4["A_mask"]
     bin_ids = cache_wo4["bin_ids"]
 
-    # Get dimensions from manifest
-    manifest = cache_wo4.get("_manifest", {})
-    H = manifest.get("H")
-    W = manifest.get("W")
-    C = manifest.get("C", 10)
-    N = manifest.get("N")
-
-    if H is None or W is None or N is None:
-        raise ValueError(f"WO-04 cache manifest missing dimensions for task {task_id}")
-
-    # Load WO-05 cache for constraints and quotas
-    cache_wo5 = cache_module.load_cache(5, task_id, data_root)
-    if cache_wo5 is None:
-        raise FileNotFoundError(f"WO-05 cache not found for task {task_id}. Run WO-05 first.")
+    # === LOAD WO-05 CACHE (quotas, cell_caps, equalizers, faces) ===
+    if per_canvas_mode:
+        # Per-canvas: .cache/wo05/{task_id}.{test_idx}.{canvas_id}.npz
+        wo5_cache_path = cache_root / "wo05" / f"{task_id}.{test_idx}.{canvas_id}.npz"
+        if not wo5_cache_path.exists():
+            raise FileNotFoundError(f"WO-05 per-canvas cache not found: {wo5_cache_path}")
+        cache_wo5 = np.load(wo5_cache_path)
+    else:
+        # Task-level (legacy)
+        cache_wo5 = cache_module.load_cache(5, task_id, data_root)
+        if cache_wo5 is None:
+            raise FileNotFoundError(f"WO-05 cache not found for task {task_id}. Run WO-05 first.")
 
     # Extract WO-5 artifacts
-    num_bins = int(cache_wo5["num_bins"][0])
     quotas_array = cache_wo5["quotas"]
-    cell_caps_array = cache_wo5["cell_caps"]
 
     # Reconstruct bins from bin_ids
     bins_dict = {}
+    num_bins = int(bin_ids.max()) + 1
     for s in range(num_bins):
         bins_dict[s] = []
 
@@ -90,19 +123,35 @@ def load_wo7_inputs(task_id: str, data_root: Path) -> Dict:
         s, c, count = int(row[0]), int(row[1]), int(row[2])
         quotas[(s, c)] = count
 
-    # Reconstruct cell_caps from array
+    # Reconstruct cell_caps from array (if present)
     cell_caps = {}
-    for r in range(H):
-        for j in range(W):
-            cell_caps[(r, j)] = int(cell_caps_array[r, j])
+    if "cell_caps" in cache_wo5:
+        cell_caps_array = cache_wo5["cell_caps"]
+        for r in range(H):
+            for j in range(W):
+                cell_caps[(r, j)] = int(cell_caps_array[r, j])
+    else:
+        # Default: all cells have capacity 1 (for tasks without cell_caps)
+        for r in range(H):
+            for j in range(W):
+                cell_caps[(r, j)] = 1
 
-    # Load WO-06 cache for costs
-    cache_wo6 = cache_module.load_cache(6, task_id, data_root)
-    if cache_wo6 is None:
-        raise FileNotFoundError(
-            f"WO-06 cache not found for task {task_id}. "
-            f"WO-07 requires WO-06 costs to be cached. Run WO-06 first."
-        )
+    # === LOAD WO-06 CACHE (costs) ===
+    if per_canvas_mode:
+        # Per-canvas: .cache/wo06/{task_id}.{test_idx}.{canvas_id}.npz
+        wo6_cache_path = cache_root / "wo06" / f"{task_id}.{test_idx}.{canvas_id}.npz"
+        if not wo6_cache_path.exists():
+            raise FileNotFoundError(f"WO-06 per-canvas cache not found: {wo6_cache_path}")
+        cache_wo6 = np.load(wo6_cache_path)
+    else:
+        # Task-level (legacy)
+        cache_wo6 = cache_module.load_cache(6, task_id, data_root)
+        if cache_wo6 is None:
+            raise FileNotFoundError(
+                f"WO-06 cache not found for task {task_id}. "
+                f"WO-07 requires WO-06 costs to be cached. Run WO-06 first."
+            )
+
     costs = cache_wo6["costs"]
 
     # Extract constant-on-bin pairs and equalizer edges from WO-05 cache keys
@@ -158,8 +207,11 @@ def load_wo7_inputs(task_id: str, data_root: Path) -> Dict:
         "faces_mode": faces_mode,
     }
 
-    # Run pre-checks before returning
-    check_input_preconditions(inputs_dict)
+    # WO-B: Skip pre-check for per-canvas mode
+    # Pre-check happens in try_pack() after faces are filtered by pack.faces_mode
+    if not per_canvas_mode:
+        # Legacy task-level mode: run pre-checks before returning
+        check_input_preconditions(inputs_dict)
 
     return inputs_dict
 

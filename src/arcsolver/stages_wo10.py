@@ -78,23 +78,29 @@ def make_pack_id_safe(pack_id: str, max_len: int = 200) -> str:
 
 def compute_delta_bits_for_pack(
     task_id: str,
+    test_idx: int,
     pack_id: str,
+    canvas_id: str,
     cache_root: Path,
 ) -> int:
     """
     Compute delta_bits for a given pack by loading its solution and running bit-meter.
 
+    WO-B: Uses per-test pack solutions and per-canvas WO-4/6 caches.
+
     Args:
         task_id: Task ID
+        test_idx: Test index
         pack_id: Pack ID
+        canvas_id: Canvas ID for loading per-canvas WO-4/6
         cache_root: Path to cache root
 
     Returns:
         Total bits (delta_bits) for this pack
     """
-    # Load pack solution from cache
+    # Load per-test pack solution from cache
     pack_id_safe = make_pack_id_safe(pack_id)
-    pack_cache_path = cache_root / "wo07" / f"{task_id}.pack_{pack_id_safe}.npz"
+    pack_cache_path = cache_root / "wo07" / f"{task_id}.{test_idx}.pack_{pack_id_safe}.npz"
 
     if not pack_cache_path.exists():
         raise FileNotFoundError(f"Pack solution cache not found: {pack_cache_path}")
@@ -111,11 +117,11 @@ def compute_delta_bits_for_pack(
     # Build x_pc from arcs
     x_pc = decode.build_xpc_from_arcs(arcs_p, arcs_c, arcs_flow, N, C)
 
-    # Load costs and A_mask for bit-meter
-    wo6_cache = np.load(cache_root / "wo06" / f"{task_id}.npz")
+    # Load per-canvas costs and A_mask for bit-meter
+    wo6_cache = np.load(cache_root / "wo06" / f"{task_id}.{test_idx}.{canvas_id}.npz")
     costs = wo6_cache["costs"]
 
-    wo4_cache = np.load(cache_root / "wo04" / f"{task_id}.npz")
+    wo4_cache = np.load(cache_root / "wo04" / f"{task_id}.{test_idx}.{canvas_id}.npz")
     A_mask = wo4_cache["A_mask"]
 
     # Compute bit-meter
@@ -127,20 +133,24 @@ def compute_delta_bits_for_pack(
 def select_best_pack_lexmin(
     packs_tried: List[Dict],
     task_id: str,
+    test_idx: int,
     cache_root: Path,
 ) -> Dict:
     """
     Select lex-min feasible pack by (optimal_cost, delta_bits, canvas(H,W), pack_id).
 
+    WO-B: Uses per-test pack solutions and per-canvas caches.
+
     Args:
         packs_tried: List of pack trial dicts from WO-9B receipt
         task_id: Task ID
+        test_idx: Test index
         cache_root: Path to cache root
 
     Returns:
         Best pack dict with pack_id, delta_bits, optimal_cost, canvas
     """
-    # Filter to feasible packs
+    # Filter to feasible packs (OPTIMAL status only, no DEFERRED per WO-B spec)
     feasible_packs = [p for p in packs_tried if p["result"]["status"] == "OPTIMAL"]
 
     if not feasible_packs:
@@ -149,11 +159,25 @@ def select_best_pack_lexmin(
     # Enrich each pack with delta_bits and canvas
     for pack in feasible_packs:
         pack_id = pack["pack_id"]
-        pack["delta_bits"] = compute_delta_bits_for_pack(task_id, pack_id, cache_root)
 
-        # Extract canvas (H, W) from pack cache
+        # Extract canvas_id from pack (stored in WO-9B receipt)
+        canvas_id = pack.get("canvas_id")
+        if canvas_id is None:
+            # Fallback: try to extract from pack_id if present
+            if "|canvas=" in pack_id:
+                canvas_id = pack_id.split("|canvas=")[-1]
+            else:
+                raise ValueError(f"Pack missing canvas_id: {pack_id}")
+
+        pack["delta_bits"] = compute_delta_bits_for_pack(
+            task_id, test_idx, pack_id, canvas_id, cache_root
+        )
+
+        # Extract canvas (H, W) from per-test pack cache
         pack_id_safe = make_pack_id_safe(pack_id)
-        pack_cache = np.load(cache_root / "wo07" / f"{task_id}.pack_{pack_id_safe}.npz")
+        pack_cache = np.load(
+            cache_root / "wo07" / f"{task_id}.{test_idx}.pack_{pack_id_safe}.npz"
+        )
         pack["canvas"] = (int(pack_cache["H"]), int(pack_cache["W"]))
 
     # Select lex-min by (optimal_cost, delta_bits, (H,W), pack_id)
@@ -256,16 +280,18 @@ def process_single_test(
     """
     Process a single test input: load WO-9B results, select lex-min pack, decode if feasible.
 
+    WO-B: Loads per-test receipt and pack solutions. All packs are OPTIMAL or INFEASIBLE (no DEFERRED).
+
     Args:
         ground_truth: Ground truth output grid (2D list) for evaluation, or None
 
     Returns:
         Dict with status, match (if evaluate), and receipt path
     """
-    # Load WO-9B receipt for this test (constant law packs)
-    wo9b_receipt_path = task_receipt_dir / "wo09b.json"
+    # WO-B: Load per-test WO-9B receipt
+    wo9b_receipt_path = task_receipt_dir / f"wo09b.{test_id}.json"
     if not wo9b_receipt_path.exists():
-        raise FileNotFoundError(f"WO-9B receipt not found: {wo9b_receipt_path}")
+        raise FileNotFoundError(f"WO-9B per-test receipt not found: {wo9b_receipt_path}")
 
     with open(wo9b_receipt_path) as f:
         wo9b_receipt = json.load(f)
@@ -273,58 +299,39 @@ def process_single_test(
     packs_tried = wo9b_receipt["packs_tried"]
     iis = wo9b_receipt.get("iis")
 
-    # Evaluate linear laws per test input (Fix 1: linear law support)
-    # Load WO-1 size laws to check for linear laws
-    wo1_cache_path = cache_root / "wo01" / f"{task_id}.size_laws.json"
-    if wo1_cache_path.exists():
-        with open(wo1_cache_path) as f:
-            wo1_cache = json.load(f)
-
-        # Check if any linear laws exist
-        linear_laws = [sl for sl in wo1_cache["size_laws"] if sl.get("law") == "linear"]
-
-        if len(linear_laws) > 0:
-            # Get test input shape
-            test_input = np.array(test_pair["input"], dtype=np.int32)
-            H_in, W_in = test_input.shape
-
-            # For each linear law, compute concrete (H,W) for this test
-            # NOTE: Full implementation would solve flows for these packs
-            # For now, mark as "linear_law_deferred" in packs_tried
-            for linear_law in linear_laws:
-                a_H = linear_law["a_H"]
-                b_H = linear_law["b_H"]
-                a_W = linear_law["a_W"]
-                b_W = linear_law["b_W"]
-
-                H_out = a_H * H_in + b_H
-                W_out = a_W * W_in + b_W
-
-                # Add placeholder pack to packs_tried
-                # Full implementation: solve flow for this (H,W) canvas
-                packs_tried.append({
-                    "pack_id": f"size={H_out}x{W_out}|faces=none|free=[]|linear",
-                    "drops": [],
-                    "result": {
-                        "status": "DEFERRED",
-                        "note": f"Linear law (H={a_H}*{H_in}+{b_H}={H_out}, W={a_W}*{W_in}+{b_W}={W_out}) detected but not yet solved",
-                    },
-                })
+    # WO-B: All packs are already solved by WO-9A′ + WO-9B
+    # No DEFERRED status (linear laws are concretized per-test in WO-9A′)
+    # Acceptance check: verify no DEFERRED status
+    for pack in packs_tried:
+        if pack["result"]["status"] == "DEFERRED":
+            raise ValueError(
+                f"WO-B violation: Pack has DEFERRED status: {pack['pack_id']}. "
+                f"All packs must be OPTIMAL or INFEASIBLE per acceptance criterion."
+            )
 
     # Select best pack using lex-min comparator (WO-10 responsibility)
-    best_pack = select_best_pack_lexmin(packs_tried, task_id, cache_root)
+    best_pack = select_best_pack_lexmin(packs_tried, task_id, test_id, cache_root)
 
     # Determine status
     if best_pack is not None:
-        # Check pack viability (Proposal A: reject zero-supply packs)
-        # Load WO-7 receipt to get supplies_total
-        wo7_receipt_path = task_receipt_dir / "wo07.json"
-        with open(wo7_receipt_path) as f:
-            wo7_receipt = json.load(f)
-        supplies_total = wo7_receipt["graph"]["supplies"]["total"]
+        # WO-B: Zero-supply gate check
+        # Extract canvas_id from selected pack
+        selected_pack_id = best_pack["pack_id"]
+        canvas_id = best_pack.get("canvas_id")
+        if canvas_id is None:
+            if "|canvas=" in selected_pack_id:
+                canvas_id = selected_pack_id.split("|canvas=")[-1]
+            else:
+                raise ValueError(f"Selected pack missing canvas_id: {selected_pack_id}")
 
-        # Load A_mask from WO-4 cache
-        wo4_cache_path = cache_root / "wo04" / f"{task_id}.npz"
+        # Load per-canvas WO-5 cache to compute supplies_total
+        wo5_cache_path = cache_root / "wo05" / f"{task_id}.{test_id}.{canvas_id}.npz"
+        wo5_cache = np.load(wo5_cache_path)
+        quotas_array = wo5_cache["quotas"]
+        supplies_total = int(quotas_array[:, 2].sum())  # Sum of all quota counts
+
+        # Load A_mask from per-canvas WO-4 cache
+        wo4_cache_path = cache_root / "wo04" / f"{task_id}.{test_id}.{canvas_id}.npz"
         wo4_cache = np.load(wo4_cache_path)
         allowed_any = bool(wo4_cache["A_mask"].any())
 
@@ -333,7 +340,6 @@ def process_single_test(
 
         if zero_supply_pack:
             # Reject degenerate pack → UNSAT per §11/§16
-            selected_pack_id = best_pack["pack_id"]
             result = {
                 "status": "UNSAT",
                 "pack_viability": {
@@ -348,13 +354,13 @@ def process_single_test(
             status = "UNSAT"
         else:
             # Feasible - load selected pack's solution and decode
-            selected_pack_id = best_pack["pack_id"]
             delta_bits = best_pack["delta_bits"]
 
             result = process_feasible_test(
                 task_id,
                 test_id,
                 selected_pack_id,
+                canvas_id,
                 delta_bits,
                 data_root,
                 cache_root,
@@ -401,6 +407,7 @@ def process_feasible_test(
     task_id: str,
     test_id: int,
     selected_pack_id: str,
+    canvas_id: str,
     delta_bits: int,
     data_root: Path,
     cache_root: Path,
@@ -408,15 +415,18 @@ def process_feasible_test(
     """
     Process a feasible test: load cached solution, decode.
 
+    WO-B: Uses per-test pack solutions and per-canvas WO-4 caches.
+
     Args:
+        canvas_id: Canvas ID for loading per-canvas WO-4
         delta_bits: Pre-computed delta_bits from lex-min selection
 
     Returns:
         Dict with y_hat, delta_bits, and all validation flags
     """
-    # Load cached solution for selected pack
+    # Load per-test cached solution for selected pack
     pack_id_safe = make_pack_id_safe(selected_pack_id)
-    pack_cache_path = cache_root / "wo07" / f"{task_id}.pack_{pack_id_safe}.npz"
+    pack_cache_path = cache_root / "wo07" / f"{task_id}.{test_id}.pack_{pack_id_safe}.npz"
 
     if not pack_cache_path.exists():
         raise FileNotFoundError(f"Pack solution cache not found: {pack_cache_path}")
@@ -436,8 +446,8 @@ def process_feasible_test(
     # Decode to Y_hat
     Y_hat, one_of_10_ok, is_binary_ok = decode.decode_from_xpc(x_pc, H, W)
 
-    # Load A_mask for mask compliance check
-    wo4_cache = np.load(cache_root / "wo04" / f"{task_id}.npz")
+    # Load per-canvas A_mask for mask compliance check
+    wo4_cache = np.load(cache_root / "wo04" / f"{task_id}.{test_id}.{canvas_id}.npz")
     A_mask = wo4_cache["A_mask"]
 
     # Check mask compliance

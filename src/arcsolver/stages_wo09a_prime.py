@@ -69,7 +69,63 @@ def run_wo09a_prime(task_id: str, data_root: Path) -> Dict:
             size_laws.append(size_law)
 
     if len(size_laws) == 0:
-        raise ValueError(f"No size laws found for task {task_id} in WO-1")
+        # Per 04_engg_spec.md:43 — if no law fits, emit UNSAT(SizeLaw)
+        # Must write per-test pack caches for WO-9B glob discovery + task receipt
+        wo9_cache_dir = cache_root / "wo09"
+        wo9_cache_dir.mkdir(parents=True, exist_ok=True)
+
+        tests_processed = []
+        for test_idx, test_pair in enumerate(test_pairs):
+            # Write empty pack cache for this test (WO-9B discovers via glob)
+            wo9_cache_path = wo9_cache_dir / f"{task_id}.{test_idx}.packs.json"
+            packs_cache = {
+                "packs": [],
+                "packs_count": 0,
+                "test_idx": test_idx,
+                "size_laws_complete": True,
+                "size_inference": {
+                    "status": "UNSAT",
+                    "code": "SIZE_LAW_EMPTY",
+                    "note": "WO-1 proved no valid size law from trainings (04_engg_spec.md §1)",
+                },
+                "canvases_processed": [],
+            }
+            with open(wo9_cache_path, "w") as f:
+                json.dump(packs_cache, f, indent=2, sort_keys=True)
+
+            tests_processed.append({
+                "test_idx": test_idx,
+                "packs_count": 0,
+                "canvases": [],
+            })
+
+        # Write task-level receipt
+        receipt = {
+            "stage": "wo09a_prime",
+            "task_id": task_id,
+            "tests_processed": tests_processed,
+            "total_packs_count": 0,
+            "total_tests": len(test_pairs),
+            "size_laws_count": 0,
+            "status": "UNSAT",
+            "reason": "SIZE_LAW_EMPTY",
+            "note": "WO-1 proved no valid size law; cannot enumerate packs",
+        }
+
+        # Compute receipt hash
+        canonical_json = json.dumps(receipt, sort_keys=True, separators=(",", ":"))
+        receipt["hash"] = hashlib.sha256(canonical_json.encode()).hexdigest()
+
+        # Write task receipt
+        receipts_dir = Path("receipts")
+        task_receipt_dir = receipts_dir / task_id
+        task_receipt_dir.mkdir(exist_ok=True, parents=True)
+
+        wo09a_prime_receipt_path = task_receipt_dir / "wo09a_prime.json"
+        with open(wo09a_prime_receipt_path, "w") as f:
+            json.dump(receipt, f, indent=2, sort_keys=True)
+
+        return receipt
 
     # === LOAD WO-6 CACHE (FREE maps) ===
     wo6_free_maps_path = cache_root / "wo06" / f"{task_id}.free_maps.json"
@@ -218,6 +274,44 @@ def run_wo09a_prime(task_id: str, data_root: Path) -> Dict:
                 save_dict["faces_S"] = faces_S
 
             np.savez_compressed(wo5_cache_path, **save_dict)
+
+            # === COMPUTE WO-6 PER CANVAS (WO-B Phase 1) ===
+            wo6_result = canvas_ops.wo6_per_canvas(
+                train_outputs_embedded=train_outputs_embedded,
+                A_mask=A_mask,
+                bin_ids=bin_ids,
+                H=H_out,
+                W=W_out,
+                free_maps_verified=free_maps_verified,  # Task-level verified FREE maps
+            )
+
+            costs = wo6_result["costs"]
+            meta = wo6_result["meta"]
+
+            # Save WO-6 cache with proper structure per WO-B.md:22
+            wo6_cache_dir = cache_root / "wo06"
+            wo6_cache_dir.mkdir(parents=True, exist_ok=True)
+            wo6_cache_path = wo6_cache_dir / f"{task_id}.{test_idx}.{canvas_id}.npz"
+
+            # Compute hashes for acceptance verification
+            A_hash = hashlib.sha256(A_mask.tobytes(order='C')).digest()  # WO-04 mask hash
+            free_maps_json = json.dumps(free_maps_verified, sort_keys=True, separators=(",", ":"))
+            free_maps_hash = hashlib.sha256(free_maps_json.encode()).digest()
+
+            # Save with direct field names (not meta_ prefix) per spec
+            np.savez_compressed(
+                wo6_cache_path,
+                costs=costs,
+                pi_safe_ok=np.array(meta["pi_safe_ok"], dtype=np.bool_),
+                free_invariance_ok=np.array(meta["free_invariance_ok"], dtype=np.bool_),
+                A_hash_used=A_hash,
+                free_maps_hash=free_maps_hash,
+                H=np.array(meta["H"], dtype=np.int32),
+                W=np.array(meta["W"], dtype=np.int32),
+                C=np.array(meta["C"], dtype=np.int32),
+                N=np.array(meta["N"], dtype=np.int32),
+                costs_hash=meta["costs_hash"].encode('utf-8'),
+            )
 
             # === ENUMERATE FACES MODES ===
             has_faces = (faces_R is not None and faces_R.sum() > 0) or \

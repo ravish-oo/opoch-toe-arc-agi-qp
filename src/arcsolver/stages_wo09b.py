@@ -32,11 +32,15 @@ def cache_pack_solution(
     W: int,
     C: int,
     A_mask: np.ndarray,
+    test_idx: int,
+    canvas_id: str,
 ) -> None:
     """
     Cache a feasible pack's solution for WO-10 lex-min selection.
 
-    Saves .cache/wo07/<task_id>.<pack_id_safe>.npz with:
+    WO-B: Saves per-test cache at .cache/wo07/<task_id>.<test_idx>.pack_<pack_id_safe>.npz
+
+    Includes:
     - bin_to_pixel arc flows (for building x_pc)
     - Canvas dimensions (H, W, C)
     - Pack ID
@@ -63,18 +67,19 @@ def cache_pack_solution(
     # Compute hashes for determinism checks
     A_hash = hashlib.sha256(A_mask.tobytes(order='C')).hexdigest()
 
-    # Load WO-6 costs for hash
-    wo6_cache = np.load(cache_root / "wo06" / f"{task_id}.npz")
+    # Load WO-6 per-canvas costs for hash
+    wo6_cache_path = cache_root / "wo06" / f"{task_id}.{test_idx}.{canvas_id}.npz"
+    wo6_cache = np.load(wo6_cache_path)
     costs = wo6_cache["costs"]
     costs_hash = hashlib.sha256(costs.tobytes(order='C')).hexdigest()
 
-    # Save to cache with pack_id in filename (safe encoding)
+    # Save to per-test cache with pack_id in filename (safe encoding)
     cache_dir = cache_root / "wo07"
     cache_dir.mkdir(exist_ok=True, parents=True)
 
     # Make pack_id filesystem-safe (handles long pack IDs via hashing)
     pack_id_safe = make_pack_id_safe(pack_id)
-    cache_path = cache_dir / f"{task_id}.pack_{pack_id_safe}.npz"
+    cache_path = cache_dir / f"{task_id}.{test_idx}.pack_{pack_id_safe}.npz"
 
     np.savez(
         cache_path,
@@ -96,37 +101,74 @@ def cache_pack_solution(
     )
 
 
-def run_wo09b(task_id: str, data_root: Path) -> Dict:
+def _process_test_packs(
+    task_id: str,
+    data_root: Path,
+    test_idx: int,
+) -> Dict:
     """
-    WO-9B: Laminar greedy relaxation for a single task.
+    Process packs for a single test: try each with laminar relaxation.
 
     Args:
         task_id: Task ID
         data_root: Path to data directory
+        test_idx: Test index
 
     Returns:
-        Receipt dict with selected_pack_id, packs_tried, iis, hash
+        Dict with packs_tried, any_feasible, iis
     """
     cache_root = data_root.parent / ".cache"
 
-    # === LOAD PACKS FROM WO-9A CACHE ===
-    wo9a_cache_path = cache_root / "wo09" / f"{task_id}.packs.json"
+    # === LOAD PER-TEST PACKS FROM WO-9A′ CACHE ===
+    wo9a_cache_path = cache_root / "wo09" / f"{task_id}.{test_idx}.packs.json"
     if not wo9a_cache_path.exists():
-        raise FileNotFoundError(f"WO-9A cache not found: {wo9a_cache_path}")
+        raise FileNotFoundError(f"WO-9A per-test cache not found: {wo9a_cache_path}")
 
     with open(wo9a_cache_path) as f:
-        packs_data = json.load(f)
+        packs_cache = json.load(f)
 
-    # Convert to Pack objects
-    packs = []
+    packs_data = packs_cache.get("packs", [])
+
+    # Handle SIZE_LAW_EMPTY from WO-9A' (per 04_engg_spec.md:43)
+    # If WO-1 proved no size law, WO-9A' emits empty packs → propagate UNSAT
+    if packs_cache.get("packs_count", 0) == 0:
+        size_inference = packs_cache.get("size_inference", {})
+        return {
+            "test_idx": test_idx,
+            "any_feasible": False,
+            "packs_tried": [],
+            "iis": {"present": False},
+            "status": "UNSAT",
+            "reason": size_inference.get("code", "SIZE_LAW_EMPTY"),
+            "note": size_inference.get("note", "No packs to try; propagating UNSAT from WO-9A'"),
+        }
+
+    # Convert to Pack objects (with canvas_id metadata)
+    packs_with_canvas = []
     for pack_dict in packs_data:
+        # Extract canvas_id from pack dict
+        canvas_id = pack_dict.get("canvas_id")
+        if canvas_id is None:
+            raise ValueError(f"Pack missing canvas_id: {pack_dict.get('pack_id')}")
+
         # Reconstruct SizeLaw
         size_law_dict = pack_dict["size_law"]
-        size_law = packs_module.SizeLaw(
-            law=size_law_dict["law"],
-            H=size_law_dict["H"],
-            W=size_law_dict["W"],
-        )
+        if size_law_dict["law"] == "constant":
+            size_law = packs_module.SizeLaw(
+                law="constant",
+                H=size_law_dict["H"],
+                W=size_law_dict["W"],
+            )
+        elif size_law_dict["law"] == "linear":
+            size_law = packs_module.SizeLaw(
+                law="linear",
+                a_H=size_law_dict["a_H"],
+                b_H=size_law_dict["b_H"],
+                a_W=size_law_dict["a_W"],
+                b_W=size_law_dict["b_W"],
+            )
+        else:
+            raise ValueError(f"Unknown size law: {size_law_dict['law']}")
 
         # Reconstruct FreeMap objects
         free_maps = []
@@ -161,23 +203,25 @@ def run_wo09b(task_id: str, data_root: Path) -> Dict:
             free_maps=free_maps,
             quick=quick,
         )
-        packs.append(pack)
-
-    # === LOAD BASE INPUTS FROM CACHES ===
-    # Load using flows module
-    base_inputs = flows.load_wo7_inputs(task_id, data_root)
-
-    # Also load A_mask and bin_ids for quota reduction
-    cache_wo4 = np.load(cache_root / "wo04" / f"{task_id}.npz")
-    A_mask = cache_wo4["A_mask"]
-    bin_ids = cache_wo4["bin_ids"]
+        packs_with_canvas.append((pack, canvas_id))
 
     # === TRY PACKS IN LEX ORDER ===
     packs_tried = []
     iis = None
     any_feasible = False
 
-    for pack in packs:
+    for pack, canvas_id in packs_with_canvas:
+        # Load per-canvas base inputs
+        base_inputs = flows.load_wo7_inputs(
+            task_id,
+            data_root,
+            test_idx=test_idx,
+            canvas_id=canvas_id,
+        )
+
+        # Extract A_mask and bin_ids for quota reduction
+        A_mask = base_inputs["A_mask"]
+        bin_ids = base_inputs["bin_ids"]
         pack_trial = {
             "pack_id": pack.pack_id,
             "drops": [],
@@ -201,6 +245,9 @@ def run_wo09b(task_id: str, data_root: Path) -> Dict:
             result.cost_equal_ok,
         ]):
             # Feasible! Cache for WO-10 lex-min selection
+            # Store the MODIFIED pack_id (after drops) for WO-10 to load correct cache
+            pack_trial["pack_id"] = current_pack.pack_id
+            pack_trial["canvas_id"] = canvas_id  # For WO-10 per-canvas loading
             pack_trial["result"] = {
                 "status": result.status,
                 "primal_balance_ok": result.primal_balance_ok,
@@ -222,6 +269,8 @@ def run_wo09b(task_id: str, data_root: Path) -> Dict:
                 base_inputs["W"],
                 base_inputs["C"],
                 A_mask,
+                test_idx,
+                canvas_id,
             )
             # Continue to try remaining packs (WO-10 needs all feasible packs for lex-min)
             continue
@@ -246,6 +295,9 @@ def run_wo09b(task_id: str, data_root: Path) -> Dict:
                 result.cost_equal_ok,
             ]):
                 # Feasible after dropping faces
+                # Store the MODIFIED pack_id (after drops)
+                pack_trial["pack_id"] = current_pack.pack_id
+                pack_trial["canvas_id"] = canvas_id  # For WO-10 per-canvas loading
                 pack_trial["result"] = {
                     "status": result.status,
                     "primal_balance_ok": result.primal_balance_ok,
@@ -267,6 +319,8 @@ def run_wo09b(task_id: str, data_root: Path) -> Dict:
                     base_inputs["W"],
                     base_inputs["C"],
                     A_mask,
+                    test_idx,
+                    canvas_id,
                 )
                 # Continue to try remaining packs
                 continue
@@ -299,6 +353,9 @@ def run_wo09b(task_id: str, data_root: Path) -> Dict:
                     result.cost_equal_ok,
                 ]):
                     # Feasible after quota reduction
+                    # Store the MODIFIED pack_id (after drops)
+                    pack_trial["pack_id"] = current_pack.pack_id
+                    pack_trial["canvas_id"] = canvas_id  # For WO-10 per-canvas loading
                     pack_trial["result"] = {
                         "status": result.status,
                         "primal_balance_ok": result.primal_balance_ok,
@@ -320,6 +377,8 @@ def run_wo09b(task_id: str, data_root: Path) -> Dict:
                         base_inputs["W"],
                         base_inputs["C"],
                         A_mask,
+                        test_idx,
+                        canvas_id,
                     )
                     # Continue to try remaining packs
                     continue
@@ -360,20 +419,100 @@ def run_wo09b(task_id: str, data_root: Path) -> Dict:
         }
         packs_tried.append(pack_trial)
 
-    # === BUILD RECEIPT ===
-    # Note: No selected_pack_id here - WO-10 will do lex-min selection
-    receipt = {
-        "stage": "wo09b",
+    # Return test results (no receipt here - done by run_wo09b)
+    return {
+        "test_idx": test_idx,
         "packs_tried": packs_tried,
         "any_feasible": any_feasible,
         "iis": iis,
     }
 
-    # Compute hash for determinism
+
+def run_wo09b(task_id: str, data_root: Path) -> Dict:
+    """
+    WO-9B: Laminar greedy relaxation for all tests in task.
+
+    WO-B: Iterates over all test cases, processes packs per-test with per-canvas WO-4/5/6.
+
+    Args:
+        task_id: Task ID
+        data_root: Path to data directory
+
+    Returns:
+        Receipt dict with tests_processed, total_any_feasible, hash
+    """
+    cache_root = data_root.parent / ".cache"
+
+    # === DISCOVER ALL TESTS ===
+    # Find all per-test pack caches to determine number of tests
+    wo9_cache_dir = cache_root / "wo09"
+    test_indices = []
+    for pack_file in wo9_cache_dir.glob(f"{task_id}.*.packs.json"):
+        # Extract test_idx from filename: {task_id}.{test_idx}.packs.json
+        parts = pack_file.stem.split(".")
+        if len(parts) >= 2:
+            try:
+                test_idx = int(parts[1])
+                test_indices.append(test_idx)
+            except ValueError:
+                pass  # Skip non-numeric test indices
+
+    if len(test_indices) == 0:
+        raise FileNotFoundError(f"No per-test packs found for task {task_id} in {wo9_cache_dir}")
+
+    test_indices = sorted(test_indices)
+
+    # === PROCESS EACH TEST ===
+    tests_processed = []
+    for test_idx in test_indices:
+        test_result = _process_test_packs(task_id, data_root, test_idx)
+        tests_processed.append(test_result)
+
+        # Save per-test receipt
+        receipts_dir = Path("receipts")
+        task_receipt_dir = receipts_dir / task_id
+        task_receipt_dir.mkdir(exist_ok=True, parents=True)
+
+        test_receipt = {
+            "stage": "wo09b",
+            "test_idx": test_idx,
+            "packs_tried": test_result["packs_tried"],
+            "any_feasible": test_result["any_feasible"],
+            "iis": test_result["iis"],
+        }
+
+        # Include UNSAT reason/note if present (SIZE_LAW_EMPTY propagation)
+        if "status" in test_result:
+            test_receipt["status"] = test_result["status"]
+        if "reason" in test_result:
+            test_receipt["reason"] = test_result["reason"]
+        if "note" in test_result:
+            test_receipt["note"] = test_result["note"]
+
+        # Compute hash for per-test determinism
+        canonical_json = json.dumps(test_receipt, sort_keys=True, separators=(",", ":"))
+        test_receipt["hash"] = hashlib.sha256(canonical_json.encode()).hexdigest()
+
+        wo09b_test_receipt_path = task_receipt_dir / f"wo09b.{test_idx}.json"
+        with open(wo09b_test_receipt_path, "w") as f:
+            json.dump(test_receipt, f, indent=2, sort_keys=True)
+
+    # === BUILD TASK-LEVEL RECEIPT ===
+    total_any_feasible = any(t["any_feasible"] for t in tests_processed)
+
+    receipt = {
+        "stage": "wo09b",
+        "task_id": task_id,
+        "tests_processed": [{"test_idx": t["test_idx"], "any_feasible": t["any_feasible"]} for t in tests_processed],
+        "total_any_feasible": total_any_feasible,
+        "total_tests": len(test_indices),
+    }
+
+    # Compute hash for task-level determinism
     canonical_json = json.dumps(receipt, sort_keys=True, separators=(",", ":"))
     receipt["hash"] = hashlib.sha256(canonical_json.encode()).hexdigest()
 
-    # === WRITE RECEIPT ===
+    # === WRITE TASK-LEVEL RECEIPT ===
     receipts_dir = Path("receipts")
     task_receipt_dir = receipts_dir / task_id
     task_receipt_dir.mkdir(exist_ok=True, parents=True)
